@@ -1,3 +1,6 @@
+from multiprocessing import process
+from os import path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import potpourri3d as pp3d
@@ -7,8 +10,16 @@ from tqdm import tqdm
 
 
 class MeshPreprocessor:
-    def __init__(self, path, subsample=0.1):
-        self.mesh = self.preprocess_mesh(path, subsample)
+    def __init__(self, mesh):
+        self.mesh = mesh
+
+    @classmethod
+    def from_file(cls, mesh_path, subsample):
+        mesh = cls.preprocess_mesh(cls, mesh_path, subsample)
+        return cls(mesh)
+
+    def __str__(self):
+        return f"MeshPreprocessor(mesh with {len(self.mesh.vertices)} vertices and {len(self.mesh.faces)} faces)"
 
     def preprocess_mesh(self, mesh_path, subsample):
         # Load the mesh
@@ -35,10 +46,17 @@ class MeshPreprocessor:
         neighbor_indices = np.where(distances <= radius)[0]
         return neighbor_indices
 
-    def compute_log_and_ptransport(self, radius=0.2):
+    def compute_log_and_ptransport(self, radius=0.2, max_neighbors=200):
         """
         Efficiently precomputes logarithmic maps and transport angles for
         all neighborhoods in a single pass using the Vector Heat Method.
+
+        This version avoids recomputing the same transported vector field
+        multiple times: we first build the neighborhood lists for every
+        center vertex, and record which centers need each source vertex q.
+        Then we compute the transport field for each source q only once and
+        fill the corresponding angles for every center that had q as a
+        neighbor.
         """
         vertices = self.mesh.vertices
         faces = self.mesh.faces
@@ -49,46 +67,61 @@ class MeshPreprocessor:
         dist_solver = pp3d.MeshHeatMethodDistanceSolver(vertices, faces)
         vector_solver = pp3d.MeshVectorHeatSolver(vertices, faces)
 
-        # Storage for the sparse neighborhood graph
-        # We store these as lists to convert to a unified tensor/format later
-        neighbor_data = []
+        # Prepare data structures
+        neighbor_data = [None] * num_vertices
+        # For each source vertex q, keep a list of center indices p that include q as a neighbor
+        centers_per_q = [[] for _ in range(num_vertices)]
+        # For each center p, map neighbor q -> position index inside that center's neighbor array
+        positions_per_center = [dict() for _ in range(num_vertices)]
 
-        print(f"Precomputing log and parallel transport for {num_vertices} vertices...")
-        for i in tqdm(range(num_vertices)):
+        # First pass: build neighborhoods and placeholders for g_qp
+        for i in range(num_vertices):
             # Identify neighbors within geodesic radius
             dists = dist_solver.compute_distance(i)
             neighbor_indices = np.where(dists <= radius)[0]
             # Remove the center vertex from its own neighborhood
             neighbor_indices = neighbor_indices[neighbor_indices != i]
 
-            # Compute the Logarithmic Map u_q
-            # This returns (N, 2) tangent coordinates for ALL vertices.
-            # We only keep the ones for the identified neighbors.
+            # If there are more neighbors than max_neighbors, we keep the closest ones.
+            if len(neighbor_indices) > max_neighbors:
+                neighbor_indices = neighbor_indices[
+                    np.argsort(dists[neighbor_indices])
+                ][:max_neighbors]
+
+            # Compute the Logarithmic Map u_q for the center i and keep only neighbors
             u_q = vector_solver.compute_log_map(i)[neighbor_indices]
 
-            # Compute Parallel Transport g_{q -> p} rotation angles
-            # In GET, these align features to the center point's gauge.
-            # Note: We compute the angle relative to the local basis.
-            g_qp_angles = []
-            for q_idx in neighbor_indices:
-                # To calculate the parallel transport angle from q to p, we transport a canonical tangent vector (1,0) from q to p and measure its angle in p's frame.
-                # transport_tangent_vector(source_index, vector) computes the vector field of transported vector from the source vertex to all others. We only need the one for i.
-                transported_v = vector_solver.transport_tangent_vector(
-                    q_idx, [1.0, 0.0]
-                )[i]
+            # Placeholder for angles; will be filled in the second pass
+            g_qp = np.zeros(len(neighbor_indices), dtype=np.float32)
 
-                # The rotation angle is the angle of the transported vector in p's frame
-                angle = np.arctan2(transported_v[1], transported_v[0])
-                g_qp_angles.append(angle)
+            # Store neighbor info
+            neighbor_data[i] = {
+                "q_indices": neighbor_indices.astype(np.int32),
+                "u_q": u_q.astype(np.float32),
+                "g_qp": g_qp,
+            }
 
-            neighbor_data.append(
-                {
-                    "p_idx": i,
-                    "q_indices": neighbor_indices.astype(np.int32),
-                    "u_q": u_q.astype(np.float32),
-                    "g_qp": np.array(g_qp_angles, dtype=np.float32),
-                }
-            )
+            # Record reverse mapping from neighbor q to center i and position
+            for pos, q in enumerate(neighbor_indices):
+                q_int = int(q)
+                centers_per_q[q_int].append(i)
+                positions_per_center[i][q_int] = pos
+
+        # Second pass: compute transport fields once per source q and fill angles for all centers
+        for q in range(num_vertices):
+            centers = centers_per_q[q]
+            if not centers:
+                continue
+
+            # Transport the canonical tangent vector (1,0) from q to all vertices
+            transported_field = vector_solver.transport_tangent_vector(q, [1.0, 0.0])
+
+            # Fill angles for every center p that had q as a neighbor
+            for p in centers:
+                pos = positions_per_center[p][q]
+                v = transported_field[p]
+                angle = np.arctan2(v[1], v[0])
+                neighbor_data[p]["g_qp"][pos] = np.float32(angle)
 
         return neighbor_data
 
@@ -125,11 +158,53 @@ class MeshPreprocessor:
 
 
 if __name__ == "__main__":
-    # Example usage
-    path = "data/SHREC11_test_database_new/T42.off"  # Replace with your mesh file path
-    preprocessor = MeshPreprocessor(path, subsample=0.1)
-    print("total vertices: ", len(preprocessor.mesh.vertices))
-    neighbor_indices = preprocessor.compute_geodesic_neighborhood(p_idx=100, radius=0.2)
-    print("neighbors: ", len(neighbor_indices))
-    res = preprocessor.compute_log_and_ptransport(radius=0.2)
-    print(res)
+    base = "data/SHREC11_test_database_new/"
+    paths = [i for i in range(0, 600) if not path.exists(f"data/processed/T{i}.pt")]
+    K = 200  # max neighbors (actual max is 318, i cap it, see neighborhood_sizes.png)
+
+    for j, file_number in enumerate(tqdm(paths)):
+        preprocessor = MeshPreprocessor.from_file(
+            base + f"T{file_number}.off", subsample=0.1
+        )
+        faces_sorted = np.sort(preprocessor.mesh.faces, axis=1)
+        has_duplicates = len(faces_sorted) != len(np.unique(faces_sorted, axis=0))
+        try:
+            neighbor_data = preprocessor.compute_log_and_ptransport(
+                radius=0.2, max_neighbors=K
+            )
+        except Exception as e:
+            print(f"Error processing file {file_number}: {e}")
+            continue
+
+        N = len(neighbor_data)  # number of vertices
+
+        # Preallocate tensors
+        neighbors = torch.full((N, K), -1, dtype=torch.long)  # neighbor indices
+        u_q = torch.zeros((N, K, 2), dtype=torch.float32)  # 2D vectors
+        g_qp = torch.zeros((N, K), dtype=torch.float32)  # cos/sin angles
+        mask = torch.zeros((N, K), dtype=torch.bool)  # valid neighbors mask
+
+        # Fill tensors
+        for i, d in enumerate(neighbor_data):
+            q_indices = d["q_indices"]
+            n = min(len(q_indices), K)  # number of neighbors (capped at K)
+
+            u = d["u_q"]
+            g = d["g_qp"]
+
+            # store neighbor indices
+            neighbors[i, :n] = torch.from_numpy(q_indices)
+            # store vectors
+            u_q[i, :n] = torch.from_numpy(u)
+            # store angles
+            g_qp[i, :n] = torch.from_numpy(g)
+            # mask
+            mask[i, :n] = True
+
+        # Save as a PyTorch file
+        torch.save(
+            {"neighbors": neighbors, "u_q": u_q, "g_qp": g_qp, "mask": mask},
+            f"data/processed/T{file_number}.pt",
+        )
+        # Save the preprocessed mesh as well, for reference (optional)
+        preprocessor.mesh.export(f"data/processed/T{file_number}.off")
