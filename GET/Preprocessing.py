@@ -1,8 +1,8 @@
-from multiprocessing import process
 from os import path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import open3d as o3d
 import potpourri3d as pp3d
 import torch
 import trimesh
@@ -15,13 +15,13 @@ class MeshPreprocessor:
 
     @classmethod
     def from_file(cls, mesh_path, subsample):
-        mesh = cls.preprocess_mesh(cls, mesh_path, subsample)
+        mesh = cls.simplify_mesh(cls, mesh_path, subsample)
         return cls(mesh)
 
     def __str__(self):
         return f"MeshPreprocessor(mesh with {len(self.mesh.vertices)} vertices and {len(self.mesh.faces)} faces)"
 
-    def preprocess_mesh(self, mesh_path, subsample):
+    def simplify_mesh(self, mesh_path, subsample):
         # Load the mesh
         mesh = trimesh.load(mesh_path)
 
@@ -125,18 +125,29 @@ class MeshPreprocessor:
 
         return neighbor_data
 
+    def clean_mesh(self):
+        """Clean the mesh by removing duplicated vertices, degenerate triangles, and non-manifold edges using Open3D and Trimesh."""
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(self.mesh.vertices)
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(self.mesh.faces)
+
+        o3d_mesh.remove_duplicated_vertices()
+        o3d_mesh.remove_duplicated_triangles()
+        o3d_mesh.remove_degenerate_triangles()
+        o3d_mesh.remove_non_manifold_edges()
+
+        vertices = np.asarray(o3d_mesh.vertices)
+        faces = np.asarray(o3d_mesh.triangles)
+        clean_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+
+        clean_mesh.fill_holes()
+
+        self.mesh = clean_mesh
+
     # Function to plot the neighbors of vertex 0, debug purposes:
-    def plot_neighbors(self, p_idx, distance):
+    def plot_neighbors(self, p_idx, distance, ax):
         neighbor_indices = self.compute_geodesic_neighborhood(p_idx, distance)
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection="3d")
-        ax.scatter(
-            self.mesh.vertices[:, 0],
-            self.mesh.vertices[:, 1],
-            self.mesh.vertices[:, 2],
-            color="lightgray",
-            s=10,
-        )
+
         ax.scatter(
             self.mesh.vertices[neighbor_indices, 0],
             self.mesh.vertices[neighbor_indices, 1],
@@ -150,31 +161,33 @@ class MeshPreprocessor:
             self.mesh.vertices[p_idx, 0],
             self.mesh.vertices[p_idx, 1],
             self.mesh.vertices[p_idx, 2],
-            color="blue",
+            color="k",
             s=50,
         )
-        ax.set_title(f"Geodesic Neighborhood of Vertex {p_idx}")
-        plt.show()
 
 
 if __name__ == "__main__":
     base = "data/SHREC11_test_database_new/"
     paths = [i for i in range(0, 600) if not path.exists(f"data/processed/T{i}.pt")]
-    K = 200  # max neighbors (actual max is 318, i cap it, see neighborhood_sizes.png)
+    K = 300  # max neighbors (actual max is 318, i cap it, see neighborhood_sizes.png)
 
-    for j, file_number in enumerate(tqdm(paths)):
+    for j, filename in enumerate(tqdm(paths)):
         preprocessor = MeshPreprocessor.from_file(
-            base + f"T{file_number}.off", subsample=0.1
+            base + f"T{filename}.off", subsample=0.1
         )
-        faces_sorted = np.sort(preprocessor.mesh.faces, axis=1)
-        has_duplicates = len(faces_sorted) != len(np.unique(faces_sorted, axis=0))
         try:
             neighbor_data = preprocessor.compute_log_and_ptransport(
                 radius=0.2, max_neighbors=K
             )
-        except Exception as e:
-            print(f"Error processing file {file_number}: {e}")
-            continue
+        except Exception:
+            preprocessor.clean_mesh()
+            try:
+                neighbor_data = preprocessor.compute_log_and_ptransport(
+                    radius=0.2, max_neighbors=K
+                )
+            except Exception as e:
+                print(f"Failed to process T{filename}.off after cleaning: {e}")
+                continue
 
         N = len(neighbor_data)  # number of vertices
 
@@ -204,7 +217,7 @@ if __name__ == "__main__":
         # Save as a PyTorch file
         torch.save(
             {"neighbors": neighbors, "u_q": u_q, "g_qp": g_qp, "mask": mask},
-            f"data/processed/T{file_number}.pt",
+            f"data/processed/T{filename}.pt",
         )
         # Save the preprocessed mesh as well, for reference (optional)
-        preprocessor.mesh.export(f"data/processed/T{file_number}.off")
+        preprocessor.mesh.export(f"data/processed/T{filename}.off")
