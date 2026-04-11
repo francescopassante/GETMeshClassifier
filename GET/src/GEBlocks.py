@@ -10,18 +10,20 @@ class LinearEquivariant(nn.Module):
     It maps input features in the rho_local representation (3D coordinates) to output features in the regular representation (12 fields, each of dimension 9).
     """
 
-    def __init__(self, W_basis, num_fields=12):
+    def __init__(self, N, num_fields):
         """
         Args:
-            W_basis: List of torch.Tensors, each of shape (9, 3).
-                     These are the SVD-solved equivariant bases.
-            num_fields: Number of regular output fields (12 for SHREC).
+            N: Dimension of the regular representation (C_N).
+            num_fields: Number of regular output fields.
         """
         super().__init__()
+        self.N = N
+        utils = GEUtils.LocalToRegular(N)
+        W_basis = utils.local_to_regular()
         self.register_buffer(
             "basis", torch.stack(W_basis)
         )  # This registers the basis as a non-learnable buffer
-        self.num_basis = self.basis.shape[0]
+        self.num_basis = self.basis.shape[0]  # Number of basis matrices
         self.num_fields = num_fields
 
         # Learnable coefficients for each basis matrix for each output field
@@ -33,18 +35,18 @@ class LinearEquivariant(nn.Module):
         Args:
             x: Input features (rho_local) of shape (Batch, Num_Points, 3)
         Returns:
-            Output feature fields of shape (Batch, Num_Points, 108)
+            Output feature fields of shape (Batch, Num_Points, num_fields * N)
         """
         # 1. Compute the kernel for each field: W = sum(a_i * W_basis_i)
-        # Resulting shape: (num_fields, 9, 3)
+        # Resulting shape: (num_fields, N, 3)
         combined_kernels = torch.einsum("fk,knm->fnm", self.weights, self.basis)
 
         # 2. Reshape kernels to a single large weight matrix for efficient computation
-        # Shape: (num_fields * 9, 3) -> (108, 3)
-        W_final = combined_kernels.view(self.num_fields * 9, 3)
+        # Shape: (num_fields, N, 3) -> (num_fields * N, 3)
+        W_final = combined_kernels.view(self.num_fields * N, 3)
 
         # 3. Apply the linear transformation to the input features
-        # (B, P, 3) @ (3, 108) -> (B, P, 108)
+        # (B, P, 3) @ (3, num_fields*N) -> (B, P, num_fields*N)
         out = torch.matmul(x, W_final.t())
 
         return out
@@ -63,8 +65,8 @@ if __name__ == "__main__":
             )
             return x @ rotation_matrix.t()
 
-        utils = GEUtils.Linear(N=9)
-        W_basis = utils.compute_W_basis()  # This should give us a list of numpy arrays
+        utils = GEUtils.LocalToRegular(N=9)
+        W_basis = utils.local_to_regular()  # This should give us a list of numpy arrays
         W_basis_torch = [torch.tensor(W, dtype=torch.float32) for W in W_basis]
         equivariant_layer = LinearEquivariant(W_basis=W_basis_torch, num_fields=12)
 
