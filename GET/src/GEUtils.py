@@ -63,7 +63,10 @@ class LocalToRegular:
         basis_vectors = vh[s < tol]
 
         # 4. Reshape to get W_i matrices (N x 3)
-        return [v.reshape(self.N, 3) for v in basis_vectors]
+        return [
+            torch.tensor(v.reshape(self.N, 3), dtype=torch.float32)
+            for v in basis_vectors
+        ]
 
     def get_local_representation_rho_in(self):
         # Rappresentazione locale: rotazione di 2pi/N intorno all'asse z

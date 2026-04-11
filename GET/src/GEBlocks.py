@@ -19,7 +19,7 @@ class LinearEquivariant(nn.Module):
         super().__init__()
         self.N = N
         utils = GEUtils.LocalToRegular(N)
-        W_basis = utils.local_to_regular()
+        W_basis = utils.local_to_regular_basis()
         self.register_buffer(
             "basis", torch.stack(W_basis)
         )  # This registers the basis as a non-learnable buffer
@@ -43,7 +43,7 @@ class LinearEquivariant(nn.Module):
 
         # 2. Reshape kernels to a single large weight matrix for efficient computation
         # Shape: (num_fields, N, 3) -> (num_fields * N, 3)
-        W_final = combined_kernels.view(self.num_fields * N, 3)
+        W_final = combined_kernels.view(self.num_fields * self.N, 3)
 
         # 3. Apply the linear transformation to the input features
         # (B, P, 3) @ (3, num_fields*N) -> (B, P, num_fields*N)
@@ -54,7 +54,7 @@ class LinearEquivariant(nn.Module):
 
 if __name__ == "__main__":
     # I want to check that if i rotate an input (x,y,z) then apply the layer i get a permutation of the output fields:
-    def check_equivariance(x, theta):
+    def check_equivariance():
         def rotate_input(x, theta):
             # Rotate around the z-axis by angle theta
             cos_theta = torch.cos(theta)
@@ -65,13 +65,10 @@ if __name__ == "__main__":
             )
             return x @ rotation_matrix.t()
 
-        utils = GEUtils.LocalToRegular(N=9)
-        W_basis = utils.local_to_regular()  # This should give us a list of numpy arrays
-        W_basis_torch = [torch.tensor(W, dtype=torch.float32) for W in W_basis]
-        equivariant_layer = LinearEquivariant(W_basis=W_basis_torch, num_fields=12)
+        equivariant_layer = LinearEquivariant(N=9, num_fields=12)
 
         # Rotate the input by 2pi/9 (the angle corresponding to the cyclic group C9) and check the output
-        theta = torch.tensor(2 * 8 * np.pi / 9, dtype=torch.float32)
+        theta = torch.tensor(2 * np.pi / 9, dtype=torch.float32)
 
         input = torch.randn(1, 1, 3)  # Original input
         rotated_input = rotate_input(input, theta)
@@ -81,3 +78,5 @@ if __name__ == "__main__":
 
         print(output[0][0][3])  # Should be (1, 1, 12, 9)
         print(rotated_output[0][0][3])  # Should be (1, 1, 12, 9)
+
+    check_equivariance()
