@@ -4,10 +4,9 @@ import torch
 import torch.nn as nn
 
 
-class LinearEquivariant(nn.Module):
+class LocalToRegularLinearBlock(nn.Module):
     """
-    A linear layer that implements the equivariant transformation using a learned combination of SVD-solved bases.
-    It maps input features in the rho_local representation (3D coordinates) to output features in the regular representation (12 fields, each of dimension 9).
+    A linear layer that implements equivariance from the rho_local representation to the regular representation for the cyclic group C_N.
     """
 
     def __init__(self, N, num_fields):
@@ -52,6 +51,71 @@ class LinearEquivariant(nn.Module):
         return out
 
 
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, N):
+        super().__init__()
+        self.N = N
+        # self.n_heads = n_heads
+        # self.d_k = out_channels // n_heads
+
+        # Query and Key linear layers
+        self.W_Q = nn.Linear(in_channels * N, out_channels)
+        self.W_K = nn.Linear(in_channels * N, out_channels)
+
+        # Value Kernel: W_V(u) is represented by a set of precomputed bases
+        # that satisfy gauge equivariance constraints [cite: 309, 1408]
+        # Here we assume you have your equivariant 'kernel_bases' precomputed
+        self.register_buffer(
+            "kernel_bases", torch.randn(6, N, N)
+        )  # Placeholder for 6 Taylor bases
+        self.kernel_coeffs = nn.Parameter(torch.randn(n_heads, 6))
+
+    def forward(self, x, neighbors, parallel_transport_matrices, rel_pos_u):
+        """
+        Args:
+            x: [N_verts, in_channels * N] - Center features
+            neighbors: [N_verts, Max_Neighbors] - Indices of neighbors
+            parallel_transport_matrices: [N_verts, Max_Neighbors, N, N] - rho_tilde(theta)
+            rel_pos_u: [N_verts, Max_Neighbors, 2] - Logarithmic map coordinates u_q
+        """
+        N_v, _ = x.shape
+
+        # 1. Parallel Transport neighbors to center frame
+        # x_neighbors shape: [N_v, Max_N, in_channels * N]
+        x_neigh = x[neighbors]
+        # Apply rho_tilde(theta) to each channel
+        x_neigh = x_neigh.view(N_v, -1, -1, self.N)
+        f_prime_q = torch.einsum(
+            "vnoj,vnpj->vnop", parallel_transport_matrices, x_neigh
+        )
+        f_prime_q = f_prime_q.reshape(N_v, -1, x.shape[-1])
+
+        # 2. Compute Attention Scores
+        Q = self.W_Q(x).view(N_v, self.n_heads, self.d_k)
+        K = self.W_K(f_prime_q).view(N_v, -1, self.n_heads, self.d_k)
+
+        # Energy S(K, Q) - typically dot product scaled by sqrt(d_k)
+        attn_scores = torch.einsum("vhd,vnhd->vnh", Q, K) / (self.d_k**0.5)
+        attn_weights = F.softmax(attn_scores, dim=1)  # [N_v, Max_N, n_heads]
+
+        # 3. Compute Values using Equivariant Kernel W_V(u)
+        # W_V(u) = W0 + W1*u1 + W2*u2 ... (Taylor Expansion) [cite: 309, 1158]
+        # For simplicity, we implement W_V(u) as a linear combination of equivariant bases
+        W_V_u = torch.einsum(
+            "h b, b i j -> h i j", self.kernel_coeffs, self.kernel_bases
+        )
+
+        # Apply value function to transported features
+        # V = W_V(u) * f_prime_q
+        f_prime_q_split = f_prime_q.view(N_v, -1, -1, self.N)
+        values = torch.einsum("hij, vncj -> vnhci", W_V_u, f_prime_q_split)
+        values = values.reshape(N_v, -1, self.n_heads, -1)
+
+        # 4. Aggregation
+        out = torch.einsum("vnh, vnhd -> vhd", attn_weights, values)
+        return out.reshape(N_v, -1)
+
+
 if __name__ == "__main__":
     # I want to check that if i rotate an input (x,y,z) then apply the layer i get a permutation of the output fields:
     def check_equivariance():
@@ -65,7 +129,7 @@ if __name__ == "__main__":
             )
             return x @ rotation_matrix.t()
 
-        equivariant_layer = LinearEquivariant(N=9, num_fields=12)
+        equivariant_layer = LocalToRegularLinearBlock(N=9, num_fields=12)
 
         # Rotate the input by 2pi/9 (the angle corresponding to the cyclic group C9) and check the output
         theta = torch.tensor(2 * np.pi / 9, dtype=torch.float32)

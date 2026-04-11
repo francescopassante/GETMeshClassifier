@@ -7,6 +7,21 @@ class RegularToRegular:
         self.N = N
         self.A = self.get_dft_matrix_A()
 
+    def regular_to_regular_basis(self):
+        """
+        Returns the basis of linear maps W_i that satisfy the equivariance condition:
+        rho @ W_i = W_i @ rho
+        where rho is the regular representation. In this case, since regular to regular, a basis is given by circulant matrices
+        """
+        basis = []
+        for i in range(self.N):
+            W_i = np.zeros((self.N, self.N))
+            for j in range(self.N):
+                W_i[j, (j + i) % self.N] = 1.0
+            basis.append(W_i)
+
+        return [torch.tensor(v, dtype=torch.float32) for v in basis]
+
     def get_dft_matrix_A(self):
         A = torch.zeros((self.N, self.N))
         A[:, 0] = 1.0 / np.sqrt(self.N)
@@ -87,25 +102,9 @@ class LocalToRegular:
 
 
 if __name__ == "__main__":
-    # def parallel_transport_regular_field(f_q, theta):
-    #     rho_tilde = RegularToRegular(N=9).extended_regular_representation(theta)
-    #     return torch.matmul(rho_tilde, f_q.unsqueeze(-1)).squeeze(-1)
-
-    # Esempio d'uso per SHREC
-    N_SHREC = 9
-    rep_handler = RegularToRegular(N_SHREC)
-    A = torch.tensor(rep_handler.get_dft_matrix_A())
-    theta_transport = (
-        2 * np.pi / 9
-    )  # Angolo ottenuto dal Vector Heat Method [cite: 1458]
-
-    # Feature al vertice q (campo regolare a 9 canali)
-    f_q = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0, 0]).to(torch.float32)
-
-    # Trasporto parallelo al vertice p
-    f_p = torch.matmul(
-        torch.tensor(rep_handler.extended_regular_representation(theta_transport)),
-        f_q.unsqueeze(-1),
-    ).squeeze(-1)
-
-    print(f_p)
+    N = 9
+    print("Regular to Regular basis:")
+    r2r = RegularToRegular(N)
+    W_r2r = r2r.regular_to_regular_basis()
+    for i, W in enumerate(W_r2r):
+        print(f"W_{i}:\n{W}\n")
