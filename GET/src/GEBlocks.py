@@ -58,9 +58,33 @@ class SelfAttentionBlock(nn.Module):
         # self.n_heads = n_heads
         # self.d_k = out_channels // n_heads
 
-        # Query and Key linear layers
-        self.W_Q = nn.Linear(in_channels * N, out_channels)
-        self.W_K = nn.Linear(in_channels * N, out_channels)
+        # Equivariant basis for Query and Key linear maps
+        basis = GEUtils.RegularToRegular(N).regular_to_regular_basis()
+        self.register_buffer("reg_to_reg_basis", torch.stack(basis))
+
+        self.query_coeffs = nn.Parameter(torch.randn(len(basis)) * 0.02)
+        self.key_coeffs = nn.Parameter(torch.randn(len(basis)) * 0.02)
+
+        # The value matrix is given by a second order Taylor expansion in the relative position u.
+        # The Taylor coefficients (matrices) must satisfy the equivariance condition in Eqn. (78) of the paper.
+        # One finds that the equivariance is satisfied order by order, so there are separate bases for the zero, first, and second order terms.
+        # So we allow a linear combination of each basis inside a given order.
+        # We learn a linear combination of these basis matrices as the value function W_V(u).
+
+        value_basis = GEUtils.RegularToRegular(N).get_taylor_basis()
+        self.register_buffer("value_basis_zero_order", value_basis[0])
+        self.register_buffer("value_basis_first_order", value_basis[1])
+        self.register_buffer("value_basis_second_order", value_basis[2])
+
+        self.value_matrix_zero_order_params = nn.Parameter(
+            torch.randn(self.value_basis_zero_order.shape[0]) * 0.02
+        )
+        self.value_matrix_first_order_params = nn.Parameter(
+            torch.randn(self.value_basis_first_order.shape[0]) * 0.02
+        )
+        self.value_matrix_second_order_params = nn.Parameter(
+            torch.randn(self.value_basis_second_order.shape[0]) * 0.02
+        )
 
         # Value Kernel: W_V(u) is represented by a set of precomputed bases
         # that satisfy gauge equivariance constraints [cite: 309, 1408]
@@ -73,10 +97,10 @@ class SelfAttentionBlock(nn.Module):
     def forward(self, x, neighbors, parallel_transport_matrices, rel_pos_u):
         """
         Args:
-            x: [N_verts, in_channels * N] - Center features
-            neighbors: [N_verts, Max_Neighbors] - Indices of neighbors
-            parallel_transport_matrices: [N_verts, Max_Neighbors, N, N] - rho_tilde(theta)
-            rel_pos_u: [N_verts, Max_Neighbors, 2] - Logarithmic map coordinates u_q
+            x: [N_v, in_channels * N] - Center features
+            neighbors: [N_v, Max_Neighbors] - Indices of neighbors
+            parallel_transport_matrices: [N_v, Max_Neighbors, N, N] - rho_tilde(theta)
+            rel_pos_u: [N_v, Max_Neighbors, 2] - Logarithmic map coordinates u_q
         """
         N_v, _ = x.shape
 
