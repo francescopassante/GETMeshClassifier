@@ -52,18 +52,21 @@ class LocalToRegularLinearBlock(nn.Module):
 
 
 class SelfAttentionBlock(nn.Module):
-    def __init__(self, N):
+    def __init__(self, N, in_channels):
         super().__init__()
         self.N = N
         # self.n_heads = n_heads
         # self.d_k = out_channels // n_heads
 
+        self.in_channels = in_channels
+
         # Equivariant basis for Query and Key linear maps
         basis = GEUtils.RegularToRegular(N).regular_to_regular_basis()
         self.register_buffer("reg_to_reg_basis", torch.stack(basis))
 
-        self.query_coeffs = nn.Parameter(torch.randn(len(basis)) * 0.02)
-        self.key_coeffs = nn.Parameter(torch.randn(len(basis)) * 0.02)
+        # Query and Key coefficients are [in_channels, len_basis] because we use a linear comb of the basis for each channel, then sum
+        self.query_coeffs = nn.Parameter(torch.randn(in_channels, len(basis)) * 0.02)
+        self.key_coeffs = nn.Parameter(torch.randn(in_channels, len(basis)) * 0.02)
 
         # The value matrix is given by a second order Taylor expansion in the relative position u.
         # The Taylor coefficients (matrices) must satisfy the equivariance condition in Eqn. (78) of the paper.
@@ -86,19 +89,27 @@ class SelfAttentionBlock(nn.Module):
             torch.randn(self.value_basis_second_order.shape[0]) * 0.02
         )
 
-        # Value Kernel: W_V(u) is represented by a set of precomputed bases
-        # that satisfy gauge equivariance constraints [cite: 309, 1408]
-        # Here we assume you have your equivariant 'kernel_bases' precomputed
-        self.register_buffer(
-            "kernel_bases", torch.randn(6, N, N)
-        )  # Placeholder for 6 Taylor bases
-        self.kernel_coeffs = nn.Parameter(torch.randn(n_heads, 6))
+    def W_K(self, x):
+        # key_coeffs are [in_channels, len_basis]
+        # reg_to_reg_basis are [len_basis, N, N] (len_basis = N tra l'altro)
+        # W_K is a NxN matrix for each channel -> [in_channels, N, N]
 
-    def forward(self, x, neighbors, parallel_transport_matrices, rel_pos_u):
+        W_K = torch.einsum("cb, bij -> cij", self.key_coeffs, self.reg_to_reg_basis)
+        x = x.view(x.shape[0], self.in_channels, self.N)  # x = [N_v, in_channels, N]
+        return torch.einsum("cij, vcj -> vi", W_K, x)
+
+    def W_Q(self, fprime):
+        # fprime is [N_v, MAX_NEIGH, in_channels, N]
+        # W_Q is [in_channels, N, N]
+        W_Q = torch.einsum("cb, bij -> cij", self.query_coeffs, self.reg_to_reg_basis)
+        return torch.einsum("cij, vncj -> vni", W_Q, fprime)
+
+    def forward(self, x, neighbors, mask, parallel_transport_matrices, rel_pos_u):
         """
         Args:
             x: [N_v, in_channels * N] - Center features
             neighbors: [N_v, Max_Neighbors] - Indices of neighbors
+            mask: [N_v, Max_Neighbors] - Binary mask for valid neighbors
             parallel_transport_matrices: [N_v, Max_Neighbors, N, N] - rho_tilde(theta)
             rel_pos_u: [N_v, Max_Neighbors, 2] - Logarithmic map coordinates u_q
         """
@@ -107,20 +118,35 @@ class SelfAttentionBlock(nn.Module):
         # 1. Parallel Transport neighbors to center frame
         # x_neighbors shape: [N_v, Max_N, in_channels * N]
         x_neigh = x[neighbors]
+
+        x_neigh = x_neigh.view(N_v, -1, self.in_channels, self.N)
+
+        # Zero-out "fake neighbors" so that x_neigh[v][n] is zero if n > actual number of neighbors for vertex v
+        mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [N_v, Max_N, 1, 1]
+        x_neigh = x_neigh * mask_expanded
+
         # Apply rho_tilde(theta) to each channel
-        x_neigh = x_neigh.view(N_v, -1, -1, self.N)
         f_prime_q = torch.einsum(
-            "vnoj,vnpj->vnop", parallel_transport_matrices, x_neigh
+            "vnij,vncj->vnci", parallel_transport_matrices, x_neigh
         )
-        f_prime_q = f_prime_q.reshape(N_v, -1, x.shape[-1])
+        print("f'_q shape: ", f_prime_q.shape)
 
         # 2. Compute Attention Scores
-        Q = self.W_Q(x).view(N_v, self.n_heads, self.d_k)
-        K = self.W_K(f_prime_q).view(N_v, -1, self.n_heads, self.d_k)
+        # print("x shape: ", x.shape)
+        K = self.W_K(x)  # .view(N_v, -1, self.n_heads, self.d_k)
+        print("K shape: ", K.shape)
+        Q = self.W_Q(f_prime_q)
+        print("Q shape: ", Q.shape)
 
-        # Energy S(K, Q) - typically dot product scaled by sqrt(d_k)
-        attn_scores = torch.einsum("vhd,vnhd->vnh", Q, K) / (self.d_k**0.5)
-        attn_weights = F.softmax(attn_scores, dim=1)  # [N_v, Max_N, n_heads]
+        score = (
+            torch.relu(Q + K.unsqueeze(1)).mean(dim=-1).masked_fill(~mask, 0)
+        )  # [N_v, Max_Neigh, in_channels]
+
+        print("Score shape: ", score.shape)
+        score_denominator = score.sum(dim=-1).clamp(min=1e-8)
+
+        attention = score / score_denominator.unsqueeze(-1)
+        print("Attention shape: ", attention.shape)
 
         # 3. Compute Values using Equivariant Kernel W_V(u)
         # W_V(u) = W0 + W1*u1 + W2*u2 ... (Taylor Expansion) [cite: 309, 1158]
@@ -167,4 +193,32 @@ if __name__ == "__main__":
         print(output[0][0][3])  # Should be (1, 1, 12, 9)
         print(rotated_output[0][0][3])  # Should be (1, 1, 12, 9)
 
-    check_equivariance()
+    # load the data
+    path = "../data/processed/T3.pt"
+    data = torch.load(path, map_location="cpu")
+    x = data["features"]  # (N_v, 3)
+    neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
+    parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors, N, N)
+    rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
+    mask = data["mask"]  # (N_v, Max_Neighbors)
+
+    N = 3
+    channels = 12
+
+    input = LocalToRegularLinearBlock(N, num_fields=channels)(
+        x
+    )  # (N_v, in_channels * N)
+
+    r2r = GEUtils.RegularToRegular(N)
+    parallel_transport_matrices = r2r.extended_regular_representation(
+        parallel_transport_angles
+    )
+
+    # print("input: ", input.shape)
+    # print("neighbors: ", neighbors.shape)
+    # print("parallel transport matrices: ", parallel_transport_matrices.shape)
+    # print("relative positions: ", rel_pos_u.shape)
+
+    sa = SelfAttentionBlock(N, in_channels=channels)
+
+    output = sa(input, neighbors, mask, parallel_transport_matrices, rel_pos_u)
