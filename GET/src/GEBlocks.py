@@ -181,7 +181,7 @@ class SelfAttentionBlock(nn.Module):
         )
 
         value_kernel = (
-            zero_order.unsqueeze(0).unsqueeze(0) + first_order + second_order
+            zero_order.unsqueeze(0).unsqueeze(0)  # + first_order + second_order
         )  # [in_channels, N_v, Max_Neigh, N, N]
 
         # Apply value function to transported features
@@ -222,32 +222,50 @@ if __name__ == "__main__":
         print(output[0][0][3])  # Should be (1, 1, 12, 9)
         print(rotated_output[0][0][3])  # Should be (1, 1, 12, 9)
 
-    # load the data
-    path = "../data/processed/T3.pt"
-    data = torch.load(path, map_location="cpu")
-    x = data["features"]  # (N_v, 3)
-    neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
-    parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors, N, N)
-    rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
-    mask = data["mask"]  # (N_v, Max_Neighbors)
+    def check_equivariance_sa(N, channels):
+        # load the data
+        path = "../data/processed/T3.pt"
+        data = torch.load(path, map_location="cpu")
+        x = data["features"]  # (N_v, 3)
+        neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
+        parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors, N, N)
+        rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
+        mask = data["mask"]  # (N_v, Max_Neighbors)
 
-    N = 3
-    channels = 12
+        # (N_v, in_channels * N)
+        l2rBlock = LocalToRegularLinearBlock(N, num_fields=channels)
 
-    input = LocalToRegularLinearBlock(N, num_fields=channels)(
-        x
-    )  # (N_v, in_channels * N)
+        r2r = GEUtils.RegularToRegular(N)
+        parallel_transport_matrices = r2r.extended_regular_representation(
+            parallel_transport_angles
+        )
 
-    r2r = GEUtils.RegularToRegular(N)
-    parallel_transport_matrices = r2r.extended_regular_representation(
-        parallel_transport_angles
-    )
+        print("partranspmatr.shape", parallel_transport_matrices.shape)
+        theta = torch.tensor(2 * np.pi / N)
+        rot_mat_3d = torch.tensor(
+            [
+                [torch.cos(theta), -torch.sin(theta), 0],
+                [torch.sin(theta), torch.cos(theta), 0],
+                [0, 0, 1],
+            ]
+        )
 
-    # print("input: ", input.shape)
-    # print("neighbors: ", neighbors.shape)
-    # print("parallel transport matrices: ", parallel_transport_matrices.shape)
-    # print("relative positions: ", rel_pos_u.shape)
+        rot_x = torch.einsum("ij,vj->vi", rot_mat_3d, x)
 
-    sa = SelfAttentionBlock(N, in_channels=channels)
+        input = l2rBlock(x)
+        rot_input = l2rBlock(rot_x)
 
-    output = sa(input, neighbors, mask, parallel_transport_matrices, rel_pos_u)
+        # A rotation of the reference frame also requires a rotation of the relative positions!
+        rot_rel_pos_u = torch.einsum("ij,vnj->vni", rot_mat_3d[:2, :2], rel_pos_u)
+
+        sa = SelfAttentionBlock(N, in_channels=channels)
+
+        output = sa(input, neighbors, mask, parallel_transport_matrices, rel_pos_u)
+        rot_output = sa(
+            rot_input, neighbors, mask, parallel_transport_matrices, rot_rel_pos_u
+        )
+
+        print(output[0])
+        print(rot_output[0])
+
+    check_equivariance_sa(N=3, channels=1)
