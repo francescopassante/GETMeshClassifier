@@ -177,11 +177,11 @@ class SelfAttentionBlock(nn.Module):
             "cb,boij,vno->vncij",
             self.value_matrix_second_order_params,
             self.value_basis_second_order,
-            torch.stack([u_0_squared, u_1_squared, u_0_u_1], dim=-1),
+            torch.stack([u_0_squared, u_0_u_1, u_1_squared], dim=-1),
         )
 
         value_kernel = (
-            zero_order.unsqueeze(0).unsqueeze(0)  # + first_order + second_order
+            zero_order.unsqueeze(0).unsqueeze(0) + first_order + second_order
         )  # [in_channels, N_v, Max_Neigh, N, N]
 
         # Apply value function to transported features
