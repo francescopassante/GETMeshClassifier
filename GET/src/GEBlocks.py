@@ -2,6 +2,7 @@ import GEUtils
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 
 class LocalToRegularLinearBlock(nn.Module):
@@ -302,3 +303,126 @@ if __name__ == "__main__":
         global_pool = GlobalAveragePooling(in_channels=3)
         print(out := global_pool(out))
         print(out.shape)
+
+    def check_gauge_invariance(data, angles, N, channels, verbose=True):
+        # This tests wether the network (local2reg linear block, self attention block, group pool, global average pool)
+        # is gauge invariant, performing a different rotation for each vertex
+
+        x = data["features"]  # (N_v, 3)
+        neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
+        parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors)
+
+        rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
+        mask = data["mask"]  # (N_v, Max_Neighbors)
+
+        l2rBlock = LocalToRegularLinearBlock(N, num_fields=channels)
+
+        r2r = GEUtils.RegularToRegular(N)
+        parallel_transport_matrices = r2r.extended_regular_representation(
+            parallel_transport_angles
+        )
+
+        sa = SelfAttentionBlock(N, in_channels=channels)
+
+        # The parallel transport angles transform as: new_theta_nv = theta_nv + random_angle_v - random_angle_n
+        new_parallel_transport_angles = (
+            parallel_transport_angles + angles.unsqueeze(-1) - angles[neighbors]
+        )
+
+        rot_parallel_transport_matrices = r2r.extended_regular_representation(
+            new_parallel_transport_angles
+        )
+
+        cos = torch.cos(angles)  # (N_v,)
+        sin = torch.sin(angles)  # (N_v,)
+
+        # fmt: off
+        rot_mat_3d = torch.stack([
+            torch.stack([cos, -sin, torch.zeros_like(cos)], dim=-1),
+            torch.stack([sin,  cos, torch.zeros_like(cos)], dim=-1),
+            torch.stack([torch.zeros_like(cos), torch.zeros_like(cos), torch.ones_like(cos)], dim=-1)
+        ], dim=-2)
+        # fmt: on
+
+        x_rot = torch.einsum("vij,vj->vi", rot_mat_3d, x)
+        rot_rel_pos_u = torch.einsum("vij,vnj->vni", rot_mat_3d[:, :2, :2], rel_pos_u)
+
+        input = l2rBlock(x)
+        rot_input = l2rBlock(x_rot)
+
+        output = sa(input, neighbors, mask, parallel_transport_matrices, rel_pos_u)
+        rot_output = sa(
+            rot_input, neighbors, mask, rot_parallel_transport_matrices, rot_rel_pos_u
+        )
+
+        # Now let's apply group pooling and average pooling:
+        group_poool = GroupPooling(in_channels=channels)
+        global_pool = GlobalAveragePooling(in_channels=channels)
+
+        out = global_pool(group_poool(output))
+        rot_out = global_pool(group_poool(rot_output))
+
+        if verbose:
+            print(
+                "gauge rotation at [0] in terms of 2pi/N: ",
+                angles[0] / (2 * np.pi / N),
+            )
+            print("Original output of self attention block, [0]: \n", output[0])
+            print(
+                "New output of self attention block with changed gauge, [0]: \n",
+                rot_output[0],
+            )
+            print("out: ", out)
+            print("rot_out: ", rot_out)
+
+        return out, rot_out
+
+    path = "../data/processed/T3.pt"
+    data = torch.load(path, map_location="cpu")
+
+    def mean_gauge_violation(data, N, channels, trials):
+        N_v = data["features"].shape[0]
+        gauge_violation = 0
+        for i in tqdm(range(trials)):
+            angles = torch.randn((N_v,), dtype=torch.float32) * 2 * np.pi / N
+            rot, rot_out = check_gauge_invariance(
+                data, angles, N, channels, verbose=False
+            )
+            gauge_violation += torch.norm(rot - rot_out) / (
+                (torch.norm(rot) + torch.norm(rot_out)) / 2
+            )
+        return gauge_violation / trials
+
+    # gauge_violations = []
+    # for N in tqdm([i for i in range(1, 11) if i % 2 == 1]):
+    #     gauge_violations.append(mean_gauge_violation(data, N, 4, 3))
+    # print([g.item() for g in gauge_violations])
+
+    import matplotlib.pyplot as plt
+
+    # runs = torch.tensor(
+    #     [
+    #         [0.0404, 0.0035, 0.0021, 0.00270, 0.0009, 0.00152],
+    #         [0.0339, 0.0073, 0.0009, 0.0012, 0.0014, 0.00117],
+    #         [0.0494, 0.0184, 0.0031, 0.0005, 0.0008, 0.00110],
+    #     ]
+    # ).mean(axis=0)
+
+    runs = [
+        0.46849676966667175,
+        0.007196597754955292,
+        0.0037321485579013824,
+        0.0010028083343058825,
+        0.0009637857438065112,
+    ]
+
+    plt.scatter(
+        [i for i in range(3, 11) if i % 2 == 1], runs[1:], c="r", marker="*", s=80
+    )
+    plt.xlabel("N")
+    plt.ylabel(r"$\frac{||GET(x) - GET(gx)||}{(||GET(x)||+||GET(gx)||)/2}$")
+    plt.grid()
+    plt.title("Gauge violation as a function of N, 4 channels, 3 runs averaged")
+    plt.show()
+
+    # 0.0015286189736798406, 0.0011697500012814999, 0.0011058930540457368
