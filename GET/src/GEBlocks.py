@@ -130,29 +130,23 @@ class SelfAttentionBlock(nn.Module):
         f_prime_q = torch.einsum(
             "vnij,vncj->vnci", parallel_transport_matrices, x_neigh
         )
-        print("f'_q shape: ", f_prime_q.shape)
 
         # 2. Compute Attention Scores
         # print("x shape: ", x.shape)
         K = self.W_K(x)  # .view(N_v, -1, self.n_heads, self.d_k)
-        print("K shape: ", K.shape)
         Q = self.W_Q(f_prime_q)
-        print("Q shape: ", Q.shape)
 
         score = (
             torch.relu(Q + K.unsqueeze(1)).mean(dim=-1).masked_fill(~mask, 0)
         )  # [N_v, Max_Neigh, in_channels]
 
-        print("Score shape: ", score.shape)
         score_denominator = score.sum(dim=-1).clamp(min=1e-8)
 
         attention = score / score_denominator.unsqueeze(-1)
-        print("Attention shape: ", attention.shape)
 
         # 3. Compute Values using Equivariant Kernel W_V(u)
         # W_V(u) = W0 + W1*u1 + W2*u2 ... (Taylor Expansion)
 
-        print("rel_pos_u shape: ", rel_pos_u.shape)
         u_0 = rel_pos_u[..., 0]
         u_1 = rel_pos_u[..., 1]
         u_0_squared = u_0**2
