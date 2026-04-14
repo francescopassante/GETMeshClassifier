@@ -76,7 +76,9 @@ class SelfAttentionBlock(nn.Module):
         # We learn a linear combination of these basis matrices as the value function W_V(u).
 
         value_basis = GEUtils.RegularToRegular(N).get_taylor_basis()
-        self.register_buffer("value_basis_zero_order", value_basis[0])
+        self.register_buffer(
+            "value_basis_zero_order", value_basis[0].squeeze(1)
+        )  # Questa la reshapo perché a ordine 0 c'è solo 1 matrice, utile dopo quando calcolo i values
         self.register_buffer("value_basis_first_order", value_basis[1])
         self.register_buffer("value_basis_second_order", value_basis[2])
 
@@ -155,35 +157,33 @@ class SelfAttentionBlock(nn.Module):
             2 * u_0 * u_1
         )  # This 2 factor i think is fundamental, goes back to the SVD solution and form of F for the second order
 
-        zero_order = torch.einsum(
-            "cb,boij->coij",
-            self.value_matrix_zero_order_params,
-            self.value_basis_zero_order,
-        ).squeeze(1)  # [N, N]
-
-        first_order = torch.einsum(
-            "cb,boij,vno->vncij",
-            self.value_matrix_first_order_params,
-            self.value_basis_first_order,
-            rel_pos_u,
-        )
-
-        second_order = torch.einsum(
-            "cb,boij,vno->vncij",
-            self.value_matrix_second_order_params,
-            self.value_basis_second_order,
-            torch.stack([u_0_squared, u_0_u_1, u_1_squared], dim=-1),
-        )
-
-        value_kernel = (
-            zero_order.unsqueeze(0).unsqueeze(0) + first_order + second_order
-        )  # [in_channels, N_v, Max_Neigh, N, N]
-
         # Apply value function to transported features
         # V = W_V(u) * f_prime_q
-        f_prime_q = f_prime_q.view(N_v, -1, self.in_channels, self.N)
 
-        values = torch.einsum("vncij,vncj->vnci", value_kernel, f_prime_q)
+        # Pre-calcola la matrice W per ogni canale: [in_channels, N, N]
+        W0 = torch.einsum(
+            "cb, bij -> cij",
+            self.value_matrix_zero_order_params,
+            self.value_basis_zero_order,
+        )
+        values = torch.einsum("cij, vncj -> vnci", W0, f_prime_q)
+
+        W1 = torch.einsum(
+            "cb, boij -> coij",
+            self.value_matrix_first_order_params,
+            self.value_basis_first_order,
+        )
+        values += torch.einsum("coij, vno, vncj -> vnci", W1, rel_pos_u, f_prime_q)
+
+        W2 = torch.einsum(
+            "cb, boij -> coij",
+            self.value_matrix_second_order_params,
+            self.value_basis_second_order,
+        )
+
+        u_quad = torch.stack([u_0_squared, u_0_u_1, u_1_squared], dim=-1)
+
+        values += torch.einsum("coij, vno, vncj -> vnci", W2, u_quad, f_prime_q)
 
         # 4. Aggregation
         out = torch.einsum("vn,vnci->vci", attention, values)  # [N_v, in_channels, N]
@@ -371,9 +371,6 @@ if __name__ == "__main__":
 
         return out, rot_out
 
-    path = "../data/processed/T3.pt"
-    data = torch.load(path, map_location="cpu")
-
     def mean_gauge_violation(data, N, channels, trials):
         N_v = data["features"].shape[0]
         gauge_violation = 0
@@ -387,36 +384,24 @@ if __name__ == "__main__":
             )
         return gauge_violation / trials
 
-    # gauge_violations = []
-    # for N in tqdm([i for i in range(1, 11) if i % 2 == 1]):
-    #     gauge_violations.append(mean_gauge_violation(data, N, 4, 3))
-    # print([g.item() for g in gauge_violations])
+    path = "../data/processed/T3.pt"
+    data = torch.load(path, map_location="cpu")
+    x = data["features"]  # (N_v, 3)
+    neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
+    parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors)
+    rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
+    mask = data["mask"]  # (N_v, Max_Neighbors)
 
-    import matplotlib.pyplot as plt
+    N = 9
+    channels = 12
 
-    # runs = torch.tensor(
-    #     [
-    #         [0.0404, 0.0035, 0.0021, 0.00270, 0.0009, 0.00152],
-    #         [0.0339, 0.0073, 0.0009, 0.0012, 0.0014, 0.00117],
-    #         [0.0494, 0.0184, 0.0031, 0.0005, 0.0008, 0.00110],
-    #     ]
-    # ).mean(axis=0)
+    l2rBlock = LocalToRegularLinearBlock(N, num_fields=channels)
 
-    runs = [
-        0.46849676966667175,
-        0.007196597754955292,
-        0.0037321485579013824,
-        0.0010028083343058825,
-        0.0009637857438065112,
-    ]
-
-    plt.scatter(
-        [i for i in range(3, 11) if i % 2 == 1], runs[1:], c="r", marker="*", s=80
+    r2r = GEUtils.RegularToRegular(N)
+    parallel_transport_matrices = r2r.extended_regular_representation(
+        parallel_transport_angles
     )
-    plt.xlabel("N")
-    plt.ylabel(r"$\frac{||GET(x) - GET(gx)||}{(||GET(x)||+||GET(gx)||)/2}$")
-    plt.grid()
-    plt.title("Gauge violation as a function of N, 4 channels, 3 runs averaged")
-    plt.show()
 
-    # 0.0015286189736798406, 0.0011697500012814999, 0.0011058930540457368
+    sa = SelfAttentionBlock(N, in_channels=channels)
+
+    out = sa(l2rBlock(x), neighbors, mask, parallel_transport_matrices, rel_pos_u)
