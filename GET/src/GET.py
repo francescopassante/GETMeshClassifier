@@ -69,6 +69,10 @@ def train(
             outputs = model(x, neighbors, mask, parallel_transport_matrices, rel_pos_u)
             raw_loss = criterion(outputs.unsqueeze(0), labels.unsqueeze(0))
 
+            if torch.isnan(raw_loss):
+                print("NAN LOSS")
+                torch.save(mesh, f"nan_mesh{i}.pth")
+
             # Scale the loss for gradient accumulation
             scaled_loss = raw_loss / accumulation_steps
             scaled_loss.backward()
@@ -78,6 +82,7 @@ def train(
 
             # Step and zero gradients at the accumulation boundary (or final batch)
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -133,7 +138,7 @@ if __name__ == "__main__":
 
     criterion = nn.CrossEntropyLoss()
 
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
     loss_hist = train(
         model=model,
