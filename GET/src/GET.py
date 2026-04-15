@@ -8,39 +8,28 @@ from tqdm import tqdm
 
 
 class GETClassifier(nn.Module):
-    def __init__(self, N, channels, out_classes):
+    def __init__(self, N, channels, heads, out_classes):
         super().__init__()
-        self.N = N
-        self.channels = channels
-
         self.local_to_regular = GEBlocks.GELocalToRegularLinearBlock(N, channels)
-        self.self_attention1 = GEBlocks.GESelfAttentionBlock(N, channels)
-        self.self_attention2 = GEBlocks.GESelfAttentionBlock(N, channels)
+
+        self.resnet_block = GEBlocks.GEResNetBlock(N, channels, heads)
+
         self.group_pool = GEBlocks.GEGroupPooling()
         self.global_average_pool = GEBlocks.GEGlobalAveragePooling()
         self.fc = nn.Linear(channels, out_classes)
 
     def forward(self, x, neighbors, mask, parallel_transport_matrices, rel_pos_u):
-        # x: (1, N_v, 3)
+        x = self.local_to_regular(x)
+        x = torch.relu(x)
 
-        # Local to regular transformation
-        x0 = self.local_to_regular(x)  # (N_v, channels, N)
-        x0 = torch.relu(x0)  # (N_v, channels, N)
-
-        # Self-attention
-        x = self.self_attention1(
-            x0, neighbors, mask, parallel_transport_matrices, rel_pos_u
-        )  # (N_v, in_channels, N)
-        x = torch.relu(x)  # (N_v, in_channels, N)
-
-        x = self.self_attention2(
+        # Pass through the ResNet Block
+        x = self.resnet_block(
             x, neighbors, mask, parallel_transport_matrices, rel_pos_u
-        )  # (N_v, in_channels, N)
-        x = x + x0  # Residual connection
+        )
 
-        x = self.group_pool(x)  # (N_v, in_channels)
-        x = self.global_average_pool(x)  # (in_channels)
-        return self.fc(x)  # (classes)
+        x = self.group_pool(x)
+        x = self.global_average_pool(x)
+        return self.fc(x)
 
 
 def train(
@@ -71,7 +60,6 @@ def train(
 
             if torch.isnan(raw_loss):
                 print("NAN LOSS")
-                torch.save(mesh, f"nan_mesh{i}.pth")
 
             # Scale the loss for gradient accumulation
             scaled_loss = raw_loss / accumulation_steps
@@ -129,16 +117,21 @@ if __name__ == "__main__":
         mesh_directory="../data/SHREC11/processed/",
         labels_file="../data/SHREC11/classes.txt",
         N=9,
-        train_percent=0.1,
+        train_percent=0.02,
     )
 
     print(len(train_loader), len(test_loader))
 
-    model = GETClassifier(N=9, channels=12, out_classes=30).to(device)
+    model = GETClassifier(N=9, channels=12, heads=2, out_classes=30).to(device)
+    model = torch.compile(model)
 
     criterion = nn.CrossEntropyLoss()
 
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    # Model parameters:
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model has {num_params} parameters")
 
     loss_hist = train(
         model=model,

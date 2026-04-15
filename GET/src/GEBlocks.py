@@ -53,66 +53,105 @@ class GELocalToRegularLinearBlock(nn.Module):
         return out
 
 
+class GERegularToRegularLinearBlock(nn.Module):
+    """
+    A linear gauge-equivariant map between regular representations.
+    """
+
+    def __init__(self, N, in_channels, out_channels):
+        super().__init__()
+        self.N = N
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Get the basis for regular-to-regular maps (size is 5 for N=9)
+        basis = GEUtils.RegularToRegular(N).regular_to_regular_basis()
+        self.register_buffer("basis", torch.stack(basis))
+        self.num_basis = self.basis.shape[0]
+
+        # Learnable coefficients: [out_channels, in_channels, num_basis]
+        self.weights = nn.Parameter(
+            torch.randn(out_channels, in_channels, self.num_basis) * 0.02
+        )
+
+    def forward(self, x):
+        # x is [N_v, in_channels, N]
+        # Construct the transformation matrix W: [out_channels, in_channels, N, N]
+        W = torch.einsum("ocb, bij -> ocij", self.weights, self.basis)
+
+        # Apply W to x
+        # Output is [N_v, out_channels, N]
+        return torch.einsum("ocij, vcj -> voi", W, x)
+
+
 class GESelfAttentionBlock(nn.Module):
     """
-    Gauge equivariant self attention block. To achieve gauge equivariance, features are parallel transported
+    Gauge equivariant self attention block with optional multiple heads. To achieve gauge equivariance, features are parallel transported
     from neighbors of each vertex to each vertex. The Key and Query maps are linear maps from (in_channels, N) to (N),
     built as: (in_channels, N) -> reg2reg linear map for each channel -> (in_channels, N) -> sum over all channels -> (N).
     The gauge invariant score is calculated as P(ReLU(K + Q)) where ReLU is computed element-wise, and P is the average
-    over all N dimensions. The attention between vertex v and neighbor n is just this score normalized for all neighbors of v.
+    over all N dimensions. The attention between vertex v and neighbor n is this score normalized for all neighbors of v.
     The Value map is built as W_V(u) applied to the feature vector f(u), parallel transported to p.
+
+    This version supports multiple attention heads. Heads are simple and independent; their scores are used to weight
+    the same values and the head outputs are averaged back into the original channel representation.
     """
 
-    def __init__(self, N, in_channels):
+    def __init__(self, N, in_channels, num_heads=1):
         super().__init__()
         self.N = N
-
         self.in_channels = in_channels
+        self.num_heads = num_heads
 
         # Equivariant basis for Query and Key linear maps
         basis = GEUtils.RegularToRegular(N).regular_to_regular_basis()
         self.register_buffer("reg_to_reg_basis", torch.stack(basis))
 
-        # Query and Key coefficients are [in_channels, len_basis] because we use a linear comb of the basis for each channel, then sum
-        self.query_coeffs = nn.Parameter(torch.randn(in_channels, len(basis)) * 0.02)
-        self.key_coeffs = nn.Parameter(torch.randn(in_channels, len(basis)) * 0.02)
+        # Query and Key coefficients are [num_heads, in_channels, len_basis]
+        self.query_coeffs = nn.Parameter(
+            torch.randn(num_heads, in_channels, len(basis)) * 0.02
+        )
+        self.key_coeffs = nn.Parameter(
+            torch.randn(num_heads, in_channels, len(basis)) * 0.02
+        )
 
         # The value matrix is given by a second order Taylor expansion in the relative position u.
-        # The Taylor coefficients (matrices) must satisfy the equivariance condition in Eqn. (78) of the paper.
-        # One finds that the equivariance is satisfied order by order, so there are separate bases for the zero, first, and second order terms.
-        # So we allow a linear combination of each basis inside a given order.
-        # We learn a linear combination of these basis matrices as the value function W_V(u).
-
         value_basis = GEUtils.RegularToRegular(N).get_taylor_basis()
-        self.register_buffer(
-            "value_basis_zero_order", value_basis[0].squeeze(1)
-        )  # Reshaping because at zero order there is only one matrix (W_0), useful for later calculations.
+        self.register_buffer("value_basis_zero_order", value_basis[0].squeeze(1))
         self.register_buffer("value_basis_first_order", value_basis[1])
         self.register_buffer("value_basis_second_order", value_basis[2])
 
+        # Add head dimension to value parameters: [H, in_channels, basis_dim]
         self.value_matrix_zero_order_params = nn.Parameter(
-            torch.randn(in_channels, self.value_basis_zero_order.shape[0]) * 0.02
+            torch.randn(num_heads, in_channels, self.value_basis_zero_order.shape[0])
+            * 0.02
         )
         self.value_matrix_first_order_params = nn.Parameter(
-            torch.randn(in_channels, self.value_basis_first_order.shape[0]) * 0.02
+            torch.randn(num_heads, in_channels, self.value_basis_first_order.shape[0])
+            * 0.02
         )
         self.value_matrix_second_order_params = nn.Parameter(
-            torch.randn(in_channels, self.value_basis_second_order.shape[0]) * 0.02
+            torch.randn(num_heads, in_channels, self.value_basis_second_order.shape[0])
+            * 0.02
+        )
+
+        self.W_M = GERegularToRegularLinearBlock(
+            N, in_channels * num_heads, in_channels
         )
 
     def W_Q(self, x):
-        # W_Q is a NxN matrix for each channel -> [in_channels, N, N]
-        W_Q = torch.einsum("cb, bij -> cij", self.query_coeffs, self.reg_to_reg_basis)
-        x = x.view(x.shape[0], self.in_channels, self.N)  # x = [N_v, in_channels, N]
-        # Sum over channels (the most general equivariant map is the sum of the most general maps for each individual channel)
-        return torch.einsum("cij, vcj -> vi", W_Q, x)
+        # W_Q is a NxN matrix for each head and each channel -> [H, in_channels, N, N]
+        W_Q = torch.einsum("hcb, bij -> hcij", self.query_coeffs, self.reg_to_reg_basis)
+        # x = [N_v, in_channels, N]
+        # Sum over channels producing one N-vector per head: result [N_v, H, N]
+        return torch.einsum("hcij, vcj -> vhi", W_Q, x)
 
     def W_K(self, fprime):
         # fprime is [N_v, MAX_NEIGH, in_channels, N]
-        # W_K is [in_channels, N, N]
-        W_K = torch.einsum("cb, bij -> cij", self.key_coeffs, self.reg_to_reg_basis)
-        # Sum over channels
-        return torch.einsum("cij, vncj -> vni", W_K, fprime)
+        # W_K is [H, in_channels, N, N]
+        W_K = torch.einsum("hcb, bij -> hcij", self.key_coeffs, self.reg_to_reg_basis)
+        # Sum over channels -> [N_v, MAX_NEIGH, H, N]
+        return torch.einsum("hcij, vncj -> vnhi", W_K, fprime)
 
     def forward(self, x, neighbors, mask, parallel_transport_matrices, rel_pos_u):
         """
@@ -123,71 +162,99 @@ class GESelfAttentionBlock(nn.Module):
             parallel_transport_matrices: [N_v, MAX_NEIGH, N, N] - rho_tilde(theta)
             rel_pos_u: [N_v, MAX_NEIGH, 2] - Logarithmic map coordinates u_q
         """
-        N_v, chan, n = x.shape
+        N_v = x.shape[0]
 
-        # Zero-out "fake neighbors" so that x_neigh[v][n] is zero if n > actual number of neighbors for vertex v
+        # Gather neighbors and apply mask once (no in-place write on a large temporary)
         x_neigh = x[neighbors].view(N_v, -1, self.in_channels, self.N)
-        x_neigh.masked_fill_(~mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+        x_neigh = x_neigh * mask.unsqueeze(-1).unsqueeze(-1).to(x_neigh.dtype)
 
-        # Parallel transport features of neighbors to center vertices
+        # Parallel transport features of neighbors to center vertices -> [N_v, MAX_NEIGH, in_channels, N]
         f_prime_q = torch.einsum(
             "vnij,vncj->vnci", parallel_transport_matrices, x_neigh
         )
 
         # Compute Query and Key
-        Q = self.W_Q(x)
-        K = self.W_K(f_prime_q)
+        Q = self.W_Q(x)  # [N_v, H, N]
+        K = self.W_K(f_prime_q)  # [N_v, MAX_NEIGH, H, N]
 
-        # Compute attention
-        score = torch.relu(Q.unsqueeze(1) + K).mean(dim=-1).masked_fill(~mask, 0)
+        # Compute attention scores per head
+        score = torch.relu(Q.unsqueeze(1) + K).mean(dim=-1)  # [N_v, MAX_NEIGH, H]
+        score = score.masked_fill(~mask.unsqueeze(-1), 0.0)
 
-        score_denominator = score.sum(dim=-1) + 1e-6
-        attention = score / score_denominator.unsqueeze(-1)
+        score_denominator = score.sum(dim=1) + 1e-6  # [N_v, H]
+        attention = score / score_denominator.unsqueeze(1)  # [N_v, MAX_NEIGH, H]
 
-        # Compute Values using Equivariant Kernel W_V(u)
-        # W_V(u) = W0 + W1*u1 + W2*u2 +W3u1^2 + 2*W4 u1u2 + W5 u2^2  (Taylor Expansion)
-
+        # --- Value path refactor ---
+        # Avoid creating huge [N_v, MAX_NEIGH, H, C, N] tensor ("values") and
+        # avoid f_u_1/f_u_2 big temporaries. We aggregate directly into head_outputs.
         u_0 = rel_pos_u[..., 0]
         u_1 = rel_pos_u[..., 1]
-        u_0_squared = u_0**2
-        u_1_squared = u_1**2
-        u_0_u_1 = (
-            2 * u_0 * u_1
-        )  # This 2 factor is necessary because of how we defined F for the second order kernel
+        u_quad = torch.stack([u_0**2, 2 * u_0 * u_1, u_1**2], dim=-1)
 
         # Apply value function to transported features
-        # V = W_V(u) * f'(u)
-
-        # Pre-calcola la matrice W per ogni canale: [in_channels, N, N]
+        # W0: [H, in_channels, N, N]
         W0 = torch.einsum(
-            "cb, bij -> cij",
+            "hcb, bij -> hcij",
             self.value_matrix_zero_order_params,
             self.value_basis_zero_order,
         )
-        values = torch.einsum("cij, vncj -> vnci", W0, f_prime_q)
+        values = torch.einsum("hcij, vncj -> vnhci", W0, f_prime_q)
 
+        # First order
         W1 = torch.einsum(
-            "cb, boij -> coij",
+            "hcb, boij -> hcoij",
             self.value_matrix_first_order_params,
             self.value_basis_first_order,
         )
+        # Contract features with u first (avoids H dimension in intermediate tensor)
+        f_u_1 = torch.einsum("vncj, vno -> vncoj", f_prime_q, rel_pos_u)
+        values = values + torch.einsum("hcoij, vncoj -> vnhci", W1, f_u_1)
 
-        temp_w1 = torch.einsum("coij, vncj -> vncoi", W1, f_prime_q)
-        values += torch.einsum("vncoi, vno -> vnci", temp_w1, rel_pos_u)
-
+        # Second order
         W2 = torch.einsum(
-            "cb, boij -> coij",
+            "hcb, boij -> hcoij",
             self.value_matrix_second_order_params,
             self.value_basis_second_order,
         )
+        f_u_2 = torch.einsum("vncj, vno -> vncoj", f_prime_q, u_quad)
+        values = values + torch.einsum("hcoij, vncoj -> vnhci", W2, f_u_2)
 
-        u_quad = torch.stack([u_0_squared, u_0_u_1, u_1_squared], dim=-1)
-        temp_w2 = torch.einsum("coij, vncj -> vncoi", W2, f_prime_q)
-        values += torch.einsum("vncoi, vno -> vnci", temp_w2, u_quad)
+        # Aggregation across neighbors using per-head attention (Safe & Fast 2-operand einsum!)
+        head_outputs = torch.einsum("vnh, vnhci -> vhci", attention, values)
 
-        # Aggregation
-        out = torch.einsum("vn,vnci->vci", attention, values)  # [N_v, in_channels, N]
+        # Use reg to reg linear block to mix heads and reduce back to in_channels:
+        out = self.W_M(
+            head_outputs.view(N_v, self.num_heads * self.in_channels, self.N)
+        )
+
         return out
+
+
+class GEResNetBlock(nn.Module):
+    """
+    A single Gauge Equivariant ResNet Block containing two multi-head self attention layers
+    """
+
+    def __init__(self, N, channels, heads):
+        super().__init__()
+        self.mhsa1 = GESelfAttentionBlock(N, channels, heads)
+        self.mhsa2 = GESelfAttentionBlock(N, channels, heads)
+
+    def forward(self, x, neighbors, mask, pt_matrices, rel_pos_u):
+        identity = x  # Save the original input for the residual connection
+
+        # First sub-layer: Attention -> Linear -> ReLU
+        out = self.mhsa1(x, neighbors, mask, pt_matrices, rel_pos_u)
+        out = torch.relu(out)
+
+        # Second sub-layer: Attention -> Linear
+        out = self.mhsa2(out, neighbors, mask, pt_matrices, rel_pos_u)
+
+        # The Residual Connection
+        out = out + identity
+
+        # Final activation
+        return torch.relu(out)
 
 
 class GEGroupPooling(nn.Module):
