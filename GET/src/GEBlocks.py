@@ -7,57 +7,65 @@ from tqdm import tqdm
 
 class GELocalToRegularLinearBlock(nn.Module):
     """
-    A linear layer that implements equivariance from the rho_local representation to the regular representation for the cyclic group C_N.
+    A layer that implements a linear gauge equivariant map from the rho_local representation to the regular representation C_N
     """
 
-    def __init__(self, N, channels):
+    def __init__(self, N, out_channels):
         """
         Args:
             N: Dimension of the regular representation (C_N).
-            channels: Number of regular output fields.
+            out_channels: Number of regular output fields.
         """
         super().__init__()
         self.N = N
         utils = GEUtils.LocalToRegular(N)
+
+        # Basis of the equivariant kernel
         W_basis = utils.local_to_regular_basis()
         self.register_buffer(
             "basis", torch.stack(W_basis)
         )  # This registers the basis as a non-learnable buffer
         self.num_basis = self.basis.shape[0]  # Number of basis matrices
-        self.channels = channels
+        self.out_channels = out_channels
 
         # Learnable coefficients for each basis matrix for each output field
         # Initializing with small random values
-        self.weights = nn.Parameter(torch.randn(channels, self.num_basis) * 0.02)
+        self.weights = nn.Parameter(torch.randn(out_channels, self.num_basis) * 0.02)
 
     def forward(self, x):
         """
         Args:
-            x: Input features (rho_local) of shape (Batch, Num_Points, 3)
+            x: Input features (rho_local) of shape (Num_Points, 3)
         Returns:
-            Output feature fields of shape (Batch, Num_Points, channels * N)
+            Output feature fields of shape (Num_Points, channels, N)
         """
-        # 1. Compute the kernel for each field: W = sum(a_i * W_basis_i)
+        # Compute the kernel for each channel: W = sum(a_i * W_basis_i)
         # Resulting shape: (channels, N, 3)
-        combined_kernels = torch.einsum("fk,knm->fnm", self.weights, self.basis)
+        combined_kernels = torch.einsum("cb,bij->cij", self.weights, self.basis)
 
-        # 2. Reshape kernels to a single large weight matrix for efficient computation
+        # Reshape kernels to a single large weight matrix for efficient computation
         # Shape: (channels, N, 3) -> (channels * N, 3)
-        W_final = combined_kernels.view(self.channels * self.N, 3)
+        W_final = combined_kernels.view(self.out_channels * self.N, 3)
 
         # 3. Apply the linear transformation to the input features
-        # (B, P, 3) @ (3, channels*N) -> (B, P, channels*N)
-        out = torch.matmul(x, W_final.t()).view(x.shape[0], self.channels, self.N)
+        out = torch.matmul(x, W_final.t()).view(x.shape[0], self.out_channels, self.N)
 
         return out
 
 
 class GESelfAttentionBlock(nn.Module):
+    """
+    Gauge equivariant self attention block. To achieve gauge equivariance, features are parallel transported
+    from neighbors of each vertex to each vertex. The Key and Query maps are linear maps from (in_channels, N) to (N),
+    built as: (in_channels, N) -> reg2reg linear map for each channel -> (in_channels, N) -> sum over all channels -> (N).
+    The gauge invariant score is calculated as P(ReLU(K + Q)) where ReLU is computed element-wise, and P is the average
+    over all N dimensions. The attention between vertex v and neighbor n is just this score normalized for all neighbors of v.
+    The Value map is built as W_V(u) applied to the feature vector f(u), parallel transported to p.
+    """
+
     def __init__(self, N, in_channels):
         super().__init__()
         self.N = N
-        # self.n_heads = n_heads
-        # self.d_k = out_channels // n_heads
 
         self.in_channels = in_channels
 
@@ -78,7 +86,7 @@ class GESelfAttentionBlock(nn.Module):
         value_basis = GEUtils.RegularToRegular(N).get_taylor_basis()
         self.register_buffer(
             "value_basis_zero_order", value_basis[0].squeeze(1)
-        )  # Questa la reshapo perché a ordine 0 c'è solo 1 matrice, utile dopo quando calcolo i values
+        )  # Reshaping because at zero order there is only one matrix (W_0), useful for later calculations.
         self.register_buffer("value_basis_first_order", value_basis[1])
         self.register_buffer("value_basis_second_order", value_basis[2])
 
@@ -92,62 +100,56 @@ class GESelfAttentionBlock(nn.Module):
             torch.randn(in_channels, self.value_basis_second_order.shape[0]) * 0.02
         )
 
-    def W_K(self, x):
-        # key_coeffs are [in_channels, len_basis]
-        # reg_to_reg_basis are [len_basis, N, N] (len_basis = N tra l'altro)
-        # W_K is a NxN matrix for each channel -> [in_channels, N, N]
-
-        W_K = torch.einsum("cb, bij -> cij", self.key_coeffs, self.reg_to_reg_basis)
-        x = x.view(x.shape[0], self.in_channels, self.N)  # x = [N_v, in_channels, N]
-        return torch.einsum("cij, vcj -> vi", W_K, x)
-
-    def W_Q(self, fprime):
-        # fprime is [N_v, MAX_NEIGH, in_channels, N]
-        # W_Q is [in_channels, N, N]
+    def W_Q(self, x):
+        # W_Q is a NxN matrix for each channel -> [in_channels, N, N]
         W_Q = torch.einsum("cb, bij -> cij", self.query_coeffs, self.reg_to_reg_basis)
-        return torch.einsum("cij, vncj -> vni", W_Q, fprime)
+        x = x.view(x.shape[0], self.in_channels, self.N)  # x = [N_v, in_channels, N]
+        # Sum over channels (the most general equivariant map is the sum of the most general maps for each individual channel)
+        return torch.einsum("cij, vcj -> vi", W_Q, x)
+
+    def W_K(self, fprime):
+        # fprime is [N_v, MAX_NEIGH, in_channels, N]
+        # W_K is [in_channels, N, N]
+        W_K = torch.einsum("cb, bij -> cij", self.key_coeffs, self.reg_to_reg_basis)
+        # Sum over channels
+        return torch.einsum("cij, vncj -> vni", W_K, fprime)
 
     def forward(self, x, neighbors, mask, parallel_transport_matrices, rel_pos_u):
         """
         Args:
             x: [N_v, in_channels * N] - Center features
-            neighbors: [N_v, Max_Neighbors] - Indices of neighbors
-            mask: [N_v, Max_Neighbors] - Binary mask for valid neighbors
-            parallel_transport_matrices: [N_v, Max_Neighbors, N, N] - rho_tilde(theta)
-            rel_pos_u: [N_v, Max_Neighbors, 2] - Logarithmic map coordinates u_q
+            neighbors: [N_v, MAX_NEIGH] - Indices of neighbors
+            mask: [N_v, MAX_NEIGH] - Binary mask for valid neighbors
+            parallel_transport_matrices: [N_v, MAX_NEIGH, N, N] - rho_tilde(theta)
+            rel_pos_u: [N_v, MAX_NEIGH, 2] - Logarithmic map coordinates u_q
         """
         N_v, chan, n = x.shape
 
-        # 1. Parallel Transport neighbors to center frame
-        # x_neighbors shape: [N_v, Max_N, in_channels * N]
+        # x_neigh : [N_v, MAX_NEIGH, channels, N]
         x_neigh = x[neighbors]
-
         x_neigh = x_neigh.view(N_v, -1, self.in_channels, self.N)
 
         # Zero-out "fake neighbors" so that x_neigh[v][n] is zero if n > actual number of neighbors for vertex v
         mask_expanded = mask.unsqueeze(-1).unsqueeze(-1)  # [N_v, Max_N, 1, 1]
         x_neigh = x_neigh * mask_expanded
 
-        # Apply rho_tilde(theta) to each channel
+        # Parallel transport features of neighbors to center vertices
         f_prime_q = torch.einsum(
             "vnij,vncj->vnci", parallel_transport_matrices, x_neigh
         )
 
-        # 2. Compute Attention Scores
-        # print("x shape: ", x.shape)
-        K = self.W_K(x)  # .view(N_v, -1, self.n_heads, self.d_k)
-        Q = self.W_Q(f_prime_q)
+        # Compute Query and Key
+        Q = self.W_Q(x)
+        K = self.W_K(f_prime_q)
 
-        score = (
-            torch.relu(Q + K.unsqueeze(1)).mean(dim=-1).masked_fill(~mask, 0)
-        )  # [N_v, Max_Neigh, in_channels]
+        # Compute attention
+        score = torch.relu(Q.unsqueeze(1) + K).mean(dim=-1).masked_fill(~mask, 0)
 
         score_denominator = score.sum(dim=-1).clamp(min=1e-8)
-
         attention = score / score_denominator.unsqueeze(-1)
 
-        # 3. Compute Values using Equivariant Kernel W_V(u)
-        # W_V(u) = W0 + W1*u1 + W2*u2 ... (Taylor Expansion)
+        # Compute Values using Equivariant Kernel W_V(u)
+        # W_V(u) = W0 + W1*u1 + W2*u2 +W3u1^2 + 2*W4 u1u2 + W5 u2^2  (Taylor Expansion)
 
         u_0 = rel_pos_u[..., 0]
         u_1 = rel_pos_u[..., 1]
@@ -155,10 +157,10 @@ class GESelfAttentionBlock(nn.Module):
         u_1_squared = u_1**2
         u_0_u_1 = (
             2 * u_0 * u_1
-        )  # This 2 factor i think is fundamental, goes back to the SVD solution and form of F for the second order
+        )  # This 2 factor is necessary because of how we defined F for the second order kernel
 
         # Apply value function to transported features
-        # V = W_V(u) * f_prime_q
+        # V = W_V(u) * f'(u)
 
         # Pre-calcola la matrice W per ogni canale: [in_channels, N, N]
         W0 = torch.einsum(
@@ -185,12 +187,17 @@ class GESelfAttentionBlock(nn.Module):
 
         values += torch.einsum("coij, vno, vncj -> vnci", W2, u_quad, f_prime_q)
 
-        # 4. Aggregation
+        # Aggregation
         out = torch.einsum("vn,vnci->vci", attention, values)  # [N_v, in_channels, N]
         return out
 
 
 class GEGroupPooling(nn.Module):
+    """
+    Group pooling takes feature field [N_v, in_channels, N] and takes the maximum over each channel -> [N_v, in_channels].
+    This operation is gauge invariant.
+    """
+
     def __init__(self):
         super().__init__()
 
@@ -199,6 +206,10 @@ class GEGroupPooling(nn.Module):
 
 
 class GEGlobalAveragePooling(nn.Module):
+    """
+    GlobalAveragePooling averages the feature field [N_v, in_channels] over the whole mesh, output is a single [in_channels] vector
+    """
+
     def __init__(self):
         super().__init__()
 
@@ -207,8 +218,14 @@ class GEGlobalAveragePooling(nn.Module):
 
 
 if __name__ == "__main__":
-    # I want to check that if i rotate an input (x,y,z) then apply the layer i get a permutation of the output fields:
-    def check_equivariance_l2r():
+
+    def check_equivariance_l2r(N, out_channels, k):
+        """
+        Demo to show that the local2regular layers is equivariant under a global rotation:
+        if i rotate the local feature by an angle 2kpi/N
+        the resulting output will be cyclically shifted by k steps.
+        """
+
         def rotate_input(x, theta):
             # Rotate around the z-axis by angle theta
             cos_theta = torch.cos(theta)
@@ -219,39 +236,45 @@ if __name__ == "__main__":
             )
             return x @ rotation_matrix.t()
 
-        equivariant_layer = GELocalToRegularLinearBlock(N=9, channels=12)
+        equivariant_layer = GELocalToRegularLinearBlock(N=N, out_channels=out_channels)
 
-        # Rotate the input by 2pi/9 (the angle corresponding to the cyclic group C9) and check the output
-        theta = torch.tensor(2 * np.pi / 9, dtype=torch.float32)
+        # Rotate the input by 2pi/N (the angle corresponding to the cyclic group C9) and check the output
+        theta = torch.tensor(2 * np.pi * k / N, dtype=torch.float32)
 
         input = torch.randn(1, 1, 3)  # Original input
         rotated_input = rotate_input(input, theta)
 
-        output = equivariant_layer(input).view(1, 1, 12, 9)
-        rotated_output = equivariant_layer(rotated_input).view(1, 1, 12, 9)
+        output = equivariant_layer(input).view(1, 1, out_channels, N)
+        rotated_output = equivariant_layer(rotated_input).view(1, 1, out_channels, N)
 
-        print(output[0][0][3])  # Should be (1, 1, 12, 9)
-        print(rotated_output[0][0][3])  # Should be (1, 1, 12, 9)
+        print(output[0][0][3])
+        print(rotated_output[0][0][3])
 
     def check_equivariance_sa(N, channels):
-        # load the data
+        """
+        Demo to check equivariance under global rotation of the self attention block.
+        If the local input is rotated by 2kpi/N, the regular field will be shifted.
+        If the self attention block is equivariant, the output of the self attention block will be cyclically shifted aswell.
+        """
+        # Take random mesh
         path = "../data/processed/T3.pt"
-        data = torch.load(path, map_location="cpu")
+        data = torch.load(path)
         x = data["features"]  # (N_v, 3)
-        neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
-        parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors, N, N)
-        rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
-        mask = data["mask"]  # (N_v, Max_Neighbors)
+        neighbors = data["neighbors"]  # (N_v, MAX_NEIGH)
+        parallel_transport_angles = data["g_qp"]  # (N_v, MAX_NEIGH, N, N)
+        rel_pos_u = data["u_q"]  # (N_v, MAX_NEIGH, 2)
+        mask = data["mask"]  # (N_v, MAX_NEIGH)
 
-        # (N_v, in_channels * N)
-        l2rBlock = GELocalToRegularLinearBlock(N, channels=channels)
+        # local2regular block
+        l2rBlock = GELocalToRegularLinearBlock(N=N, out_channels=channels)
 
+        # Generate parallel transport matrices from parallel transport angles.
         r2r = GEUtils.RegularToRegular(N)
         parallel_transport_matrices = r2r.extended_regular_representation(
             parallel_transport_angles
         )
 
-        print("partranspmatr.shape", parallel_transport_matrices.shape)
+        # Generate rotation matrix of the local features
         theta = torch.tensor(2 * np.pi / N)
         rot_mat_3d = torch.tensor(
             [
@@ -261,8 +284,10 @@ if __name__ == "__main__":
             ]
         )
 
+        # Rotate local features
         rot_x = torch.einsum("ij,vj->vi", rot_mat_3d, x)
 
+        # Compute output of the local2regular block
         input = l2rBlock(x)
         rot_input = l2rBlock(rot_x)
 
@@ -280,7 +305,10 @@ if __name__ == "__main__":
         print(rot_output[0])
 
     def show_pooling():
-        group_pool = GEGroupPooling(in_channels=3)
+        """
+        Demo to show mechanism of group pooling and global average pooling
+        """
+        group_pool = GEGroupPooling()
         input = torch.tensor(
             [
                 [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
@@ -297,18 +325,19 @@ if __name__ == "__main__":
         print(out.shape)
 
     def check_gauge_invariance(data, angles, N, channels, verbose=True):
-        # This tests wether the network (local2reg linear block, self attention block, group pool, global average pool)
-        # is gauge invariant, performing a different rotation for each vertex
+        """
+        Demo to show gauge invariance of the (local2regular -> self attention -> group pool -> global average pool) pipeline
+        Performs a different rotation of reference frame at each vertex -> needs to update relative positions and parallel transport angles
+        """
 
-        x = data["features"]  # (N_v, 3)
-        neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
-        parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors)
+        x = data["features"]
+        neighbors = data["neighbors"]
+        parallel_transport_angles = data["g_qp"]
 
-        rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
-        mask = data["mask"]  # (N_v, Max_Neighbors)
+        rel_pos_u = data["u_q"]
+        mask = data["mask"]
 
-        l2rBlock = GELocalToRegularLinearBlock(N, channels=channels)
-
+        l2rBlock = GELocalToRegularLinearBlock(N, out_channels=channels)
         r2r = GEUtils.RegularToRegular(N)
         parallel_transport_matrices = r2r.extended_regular_representation(
             parallel_transport_angles
@@ -325,8 +354,8 @@ if __name__ == "__main__":
             new_parallel_transport_angles
         )
 
-        cos = torch.cos(angles)  # (N_v,)
-        sin = torch.sin(angles)  # (N_v,)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
 
         # fmt: off
         rot_mat_3d = torch.stack([
@@ -348,8 +377,8 @@ if __name__ == "__main__":
         )
 
         # Now let's apply group pooling and average pooling:
-        group_poool = GEGroupPooling(in_channels=channels)
-        global_pool = GEGlobalAveragePooling(in_channels=channels)
+        group_poool = GEGroupPooling()
+        global_pool = GEGlobalAveragePooling()
 
         out = global_pool(group_poool(output))
         rot_out = global_pool(group_poool(rot_output))
@@ -370,6 +399,10 @@ if __name__ == "__main__":
         return out, rot_out
 
     def mean_gauge_violation(data, N, channels, trials):
+        """
+        Performs a general gauge transformation (angles not multiples of 2pi/N), and computes the difference in the output.
+        Takes the average over <trials> runs.
+        """
         N_v = data["features"].shape[0]
         gauge_violation = 0
         for i in tqdm(range(trials)):
@@ -385,21 +418,26 @@ if __name__ == "__main__":
     path = "../data/processed/T3.pt"
     data = torch.load(path, map_location="cpu")
     x = data["features"]  # (N_v, 3)
-    neighbors = data["neighbors"]  # (N_v, Max_Neighbors)
-    parallel_transport_angles = data["g_qp"]  # (N_v, Max_Neighbors)
-    rel_pos_u = data["u_q"]  # (N_v, Max_Neighbors, 2)
-    mask = data["mask"]  # (N_v, Max_Neighbors)
+    neighbors = data["neighbors"]  # (N_v, MAX_NEIGH)
+    parallel_transport_angles = data["g_qp"]  # (N_v, MAX_NEIGH)
+    rel_pos_u = data["u_q"]  # (N_v, MAX_NEIGH, 2)
+    mask = data["mask"]  # (N_v, MAX_NEIGH)
 
     N = 9
     channels = 12
 
-    l2rBlock = GELocalToRegularLinearBlock(N, channels=channels)
+    # l2rBlock = GELocalToRegularLinearBlock(N, channels=channels)
 
-    r2r = GEUtils.RegularToRegular(N)
-    parallel_transport_matrices = r2r.extended_regular_representation(
-        parallel_transport_angles
+    # r2r = GEUtils.RegularToRegular(N)
+    # parallel_transport_matrices = r2r.extended_regular_representation(
+    #     parallel_transport_angles
+    # )
+
+    angles = torch.randint(0, N, (x.shape[0],)) * 2 * np.pi / N
+    check_gauge_invariance(
+        N=N, angles=angles, channels=channels, data=data, verbose=True
     )
 
-    sa = GESelfAttentionBlock(N, in_channels=channels)
+    # sa = GESelfAttentionBlock(N, in_channels=channels)
 
-    out = sa(l2rBlock(x), neighbors, mask, parallel_transport_matrices, rel_pos_u)
+    # out = sa(l2rBlock(x), neighbors, mask, parallel_transport_matrices, rel_pos_u)
