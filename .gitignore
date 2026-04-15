@@ -5,3 +5,5 @@ data/
 *.png
 *ignore*
 papers/
+*.pt
+*.pth
