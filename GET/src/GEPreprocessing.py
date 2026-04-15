@@ -131,8 +131,12 @@ if __name__ == "__main__":
     RADIUS = 0.1  # Radius to build neighborhoods
     MAX_NEIGH = 50  # Max neighbors for each vertex
 
-    base = "../data/SHREC11_test_database_new/"
-    paths = [i for i in range(0, 600) if not path.exists(f"../data/processed/T{i}.pt")]
+    base = "../data/meshes/"
+    paths = [
+        i
+        for i in range(0, 600)
+        if not path.exists(f"../data/SHREC11/processed/T{i}.pt")
+    ]
 
     for j, filename in enumerate(tqdm(paths)):
         # Initializes the preprocessor
