@@ -172,10 +172,7 @@ class GESelfAttentionBlock(nn.Module):
             self.value_basis_first_order,
         )
 
-        # Contract C and J dimensions first -> Shape: [V, N, C, O, I]
         temp_w1 = torch.einsum("coij, vncj -> vncoi", W1, f_prime_q)
-
-        # 2. Contract the Order (O) dimension -> Shape: [V, N, C, I]
         values += torch.einsum("vncoi, vno -> vnci", temp_w1, rel_pos_u)
 
         W2 = torch.einsum(
@@ -185,9 +182,8 @@ class GESelfAttentionBlock(nn.Module):
         )
 
         u_quad = torch.stack([u_0_squared, u_0_u_1, u_1_squared], dim=-1)
-
-        W2_local = torch.einsum("coij, vno -> vncij", W2, u_quad)  # [V, N, C, I, J]
-        values += torch.einsum("vncij, vncj -> vnci", W2_local, f_prime_q)
+        temp_w2 = torch.einsum("coij, vncj -> vncoi", W2, f_prime_q)
+        values += torch.einsum("vncoi, vno -> vnci", temp_w2, u_quad)
 
         # Aggregation
         out = torch.einsum("vn,vnci->vci", attention, values)  # [N_v, in_channels, N]
