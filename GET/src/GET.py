@@ -1,5 +1,3 @@
-import time
-
 import GEBlocks
 import GEData
 import torch
