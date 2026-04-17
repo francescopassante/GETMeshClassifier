@@ -51,7 +51,6 @@ def train(
     for epoch in range(epochs):
         total_loss = 0.0
 
-        # Start with zeroed gradients for the first accumulation block
         optimizer.zero_grad()
 
         for i, mesh in enumerate(tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")):
@@ -70,10 +69,6 @@ def train(
 
             # Forward
             outputs = model(x, neighbors, mask, parallel_transport_matrices, rel_pos_u)
-            # Print the index of dimension with max output
-            # print("mesh file: ", mesh["filenumber"])
-            # print("predicted label: ", torch.argmax(outputs).item())
-            # print("True label: ", labels.item())
             raw_loss = criterion(outputs.unsqueeze(0), labels.unsqueeze(0))
 
             if torch.isnan(raw_loss):
@@ -83,16 +78,16 @@ def train(
             scaled_loss = raw_loss / accumulation_steps
             scaled_loss.backward()
 
-            # Accumulate the raw (unscaled) loss for logging
+            # Accumulate the raw loss for logging
             total_loss += raw_loss.item()
 
-            # Step and zero gradients at the accumulation boundary (or final batch)
+            # Step and zero gradients after accumulation_steps steps or at the end
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
-        # Average epoch loss (uses unscaled batch losses)
+        # Average epoch loss
         epoch_loss = total_loss / len(dataloader)
         print("epoch_loss: ", epoch_loss)
         loss_hist.append(epoch_loss)
@@ -113,17 +108,13 @@ def train(
 
 
 def load_data(mesh_directory, labels_file, N, train_percent):
-    # Esempio di utilizzo:
     full_dataset = GEData.MeshDataset(mesh_directory, labels_file, N)
 
-    # 2. Calcola le dimensioni
     train_size = int(train_percent * len(full_dataset))
     test_size = len(full_dataset) - train_size
 
-    # 3. Esegui lo split casuale
     train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
 
-    # 4. Crea i DataLoader separati
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
@@ -188,8 +179,8 @@ if __name__ == "__main__":
     device = "mps"
 
     train_loader, test_loader = load_data(
-        mesh_directory="../data/SHREC11/processed/",
-        labels_file="../data/SHREC11/classes.txt",
+        mesh_directory="../data/SHREC11_200NEIGH/processed/",
+        labels_file="../data/SHREC11_200NEIGH/classes.txt",
         N=9,
         train_percent=0.002,
     )

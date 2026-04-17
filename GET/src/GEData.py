@@ -7,20 +7,12 @@ from torch.utils.data import Dataset
 
 class MeshDataset(Dataset):
     def __init__(self, mesh_directory, labels_file, N):
-        # Ensure directory path ends with a slash
-        self.base_path = (
-            mesh_directory if mesh_directory.endswith("/") else mesh_directory + "/"
-        )
-
         # Collect existing processed files named T{idx}.pt (original dataset up to 600)
         self.filenumbers = [
             i for i in range(600) if path.exists(f"{self.base_path}T{i}.pt")
         ]
 
-        # Helper to compute extended regular representation when needed
-        self.r2r = GEUtils.RegularToRegular(N)
-
-        # Load labels file (expected format: blocks of 21 lines -> class name + 20 indices)
+        # Load labels file
         with open(labels_file) as f:
             lines = [line.strip() for line in f if line.strip()]
 

@@ -65,7 +65,6 @@ class GERegularToRegularLinearBlock(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        # Get the basis for regular-to-regular maps (size is 5 for N=9)
         basis = GEUtils.RegularToRegular(N).regular_to_regular_basis()
         self.register_buffer("basis", torch.stack(basis))
         self.num_basis = self.basis.shape[0]
@@ -123,7 +122,7 @@ class GESelfAttentionBlock(nn.Module):
         self.register_buffer("value_basis_first_order", value_basis[1])
         self.register_buffer("value_basis_second_order", value_basis[2])
 
-        # Add head dimension to value parameters: [H, in_channels, basis_dim]
+        # Value parameters: [H, in_channels, basis_dim]
         self.value_matrix_zero_order_params = nn.Parameter(
             torch.empty(num_heads, in_channels, self.value_basis_zero_order.shape[0])
         )
@@ -193,9 +192,6 @@ class GESelfAttentionBlock(nn.Module):
         score_denominator = score.sum(dim=1).clamp(min=1e-6)  # [N_v, H]
         attention = score / score_denominator.unsqueeze(1)  # [N_v, MAX_NEIGH, H]
 
-        # --- Value path refactor ---
-        # Avoid creating huge [N_v, MAX_NEIGH, H, C, N] tensor ("values") and
-        # avoid f_u_1/f_u_2 big temporaries. We aggregate directly into head_outputs.
         u_0 = rel_pos_u[..., 0]
         u_1 = rel_pos_u[..., 1]
         u_quad = torch.stack([u_0**2, 2 * u_0 * u_1, u_1**2], dim=-1)
@@ -228,7 +224,7 @@ class GESelfAttentionBlock(nn.Module):
         f_u_2 = torch.einsum("vncj, vno -> vncoj", f_prime_q, u_quad)
         values = values + torch.einsum("hcoij, vncoj -> vnhci", W2, f_u_2)
 
-        # Aggregation across neighbors using per-head attention (Safe & Fast 2-operand einsum!)
+        # Aggregation across neighbors using per-head attention
         head_outputs = torch.einsum("vnh, vnhci -> vhci", attention, values)
 
         # Use reg to reg linear block to mix heads and reduce back to in_channels:
@@ -241,7 +237,7 @@ class GESelfAttentionBlock(nn.Module):
 
 class GEResNetBlock(nn.Module):
     """
-    A single Gauge Equivariant ResNet Block containing two multi-head self attention layers
+    A single Gauge Equivariant ResNet Block containing two multi-head self attention layers and two NormLayers
     """
 
     def __init__(self, N, channels, heads):
