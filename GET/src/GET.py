@@ -13,9 +13,9 @@ class GETClassifier(nn.Module):
         super().__init__()
         self.local_to_regular = GEBlocks.GELocalToRegularLinearBlock(N, channels)
 
-        self.blocks = nn.ModuleList([
-            GEBlocks.GEResNetBlock(N, channels, heads) for _ in range(num_blocks)
-        ])
+        self.blocks = nn.ModuleList(
+            [GEBlocks.GEResNetBlock(N, channels, heads) for _ in range(num_blocks)]
+        )
 
         self.group_pool = GEBlocks.GEGroupPooling()
         self.global_average_pool = GEBlocks.GEGlobalAveragePooling()
@@ -79,6 +79,7 @@ def train(
     min_delta=1e-4,
     start_epoch=0,
     train_filenumbers=None,
+    val_filenumbers=None,
     test_filenumbers=None,
 ):
     """
@@ -91,9 +92,11 @@ def train(
         patience:           Number of epochs without improvement before stopping.
         min_delta:          Minimum decrease in val loss to count as an improvement.
         start_epoch:        Epoch to start from (use when resuming from a checkpoint).
-        train_filenumbers:  List of file numbers in the training set. Saved in every
-                            checkpoint so the session can be reproduced.
-        test_filenumbers:   Complementary list for the test set.
+        train_filenumbers:  List of file numbers in the training set.
+        val_filenumbers:    List of file numbers in the validation set.
+        test_filenumbers:   List of file numbers in the test set.
+                            All three are saved in every checkpoint so the exact
+                            train/val/test split can be reproduced later.
 
     Returns:
         (train_loss_hist, val_loss_hist)  — val_loss_hist is empty when val_loader is None.
@@ -117,6 +120,7 @@ def train(
             "train_loss": epoch_loss,
             "val_loss": val_loss,
             "train_filenumbers": train_filenumbers,
+            "val_filenumbers": val_filenumbers,
             "test_filenumbers": test_filenumbers,
         }
 
@@ -167,8 +171,12 @@ def train(
             if val_loss < best_val_loss - min_delta:
                 best_val_loss = val_loss
                 patience_counter = 0
-                torch.save(_make_checkpoint(epoch, epoch_loss, val_loss), "checkpoint_best.pth")
-                print(f"  -> New best val loss {best_val_loss:.4f}, saved checkpoint_best.pth")
+                torch.save(
+                    _make_checkpoint(epoch, epoch_loss, val_loss), "checkpoint_best.pth"
+                )
+                print(
+                    f"  -> New best val loss {best_val_loss:.4f}, saved checkpoint_best.pth"
+                )
             else:
                 patience_counter += 1
                 print(f"  -> No improvement ({patience_counter}/{patience})")
@@ -179,7 +187,9 @@ def train(
         torch.save(_make_checkpoint(epoch, epoch_loss, val_loss), "checkpoint.pth")
 
         if val_loader is not None and patience_counter >= patience:
-            print(f"Early stopping triggered after {patience} epochs without improvement.")
+            print(
+                f"Early stopping triggered after {patience} epochs without improvement."
+            )
             break
 
     return train_loss_hist, val_loss_hist
@@ -206,12 +216,18 @@ def load_data(mesh_directory, labels_file, N, train_percent, device="cpu"):
     test_filenumbers = [full_dataset.filenumbers[i] for i in test_subset.indices]
 
     train_loader = DataLoader(
-        train_subset, batch_size=1, shuffle=True,
-        num_workers=2, pin_memory=(device == "cuda"),
+        train_subset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=(device == "cuda"),
     )
     test_loader = DataLoader(
-        test_subset, batch_size=1, shuffle=False,
-        num_workers=2, pin_memory=(device == "cuda"),
+        test_subset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=(device == "cuda"),
     )
 
     return train_loader, test_loader, train_filenumbers, test_filenumbers
@@ -219,40 +235,42 @@ def load_data(mesh_directory, labels_file, N, train_percent, device="cpu"):
 
 def load_data_from_session(checkpoint_path, mesh_directory, labels_file, device="cpu"):
     """
-    Recreate the exact train/test DataLoaders from a saved checkpoint.
+    Recreate the exact train/val/test DataLoaders from a saved checkpoint.
 
-    The checkpoint must contain 'train_filenumbers', 'test_filenumbers', and 'N'
-    (all saved automatically by train()).
+    The checkpoint must contain 'train_filenumbers', 'test_filenumbers', 'N', and
+    optionally 'val_filenumbers' (all saved automatically by train()).
 
-    Returns:
-        (train_loader, test_loader, checkpoint)
-
-    The returned checkpoint dict can be used to restore the model, optimizer,
-    and scheduler states and resume training from start_epoch=checkpoint["epoch"]+1.
+    Returns a dict with keys:
+        "train_loader"  — shuffled training loader
+        "val_loader"    — validation loader (None if not saved in checkpoint)
+        "test_loader"   — test loader
+        "checkpoint"    — the full checkpoint dict, for restoring model/optimizer/
+                          scheduler and resuming from start_epoch=checkpoint["epoch"]+1
     """
     checkpoint = torch.load(checkpoint_path, weights_only=False)
-
-    train_filenumbers = checkpoint["train_filenumbers"]
-    test_filenumbers = checkpoint["test_filenumbers"]
     N = checkpoint["N"]
 
-    train_dataset = GEData.MeshDataset(
-        mesh_directory, labels_file, N, filenumbers=train_filenumbers
-    )
-    test_dataset = GEData.MeshDataset(
-        mesh_directory, labels_file, N, filenumbers=test_filenumbers
-    )
+    def _make_loader(filenumbers, shuffle):
+        dataset = GEData.MeshDataset(
+            mesh_directory, labels_file, N, filenumbers=filenumbers
+        )
+        return DataLoader(
+            dataset, batch_size=1, shuffle=shuffle,
+            num_workers=2, pin_memory=(device == "cuda"),
+        )
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=1, shuffle=True,
-        num_workers=2, pin_memory=(device == "cuda"),
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=1, shuffle=False,
-        num_workers=2, pin_memory=(device == "cuda"),
-    )
+    train_loader = _make_loader(checkpoint["train_filenumbers"], shuffle=True)
+    test_loader  = _make_loader(checkpoint["test_filenumbers"],  shuffle=False)
 
-    return train_loader, test_loader, checkpoint
+    val_filenumbers = checkpoint.get("val_filenumbers")
+    val_loader = _make_loader(val_filenumbers, shuffle=False) if val_filenumbers else None
+
+    return {
+        "train_loader": train_loader,
+        "val_loader":   val_loader,
+        "test_loader":  test_loader,
+        "checkpoint":   checkpoint,
+    }
 
 
 def check_gauge_invariance(data, N, channels, heads):
@@ -316,9 +334,36 @@ if __name__ == "__main__":
         device=device,
     )
 
-    print(f"Train: {len(train_loader)} samples, Test: {len(test_loader)} samples")
+    # Split the held-out set into val (1/3) and final test (2/3)
+    held_out = test_loader.dataset  # Subset of full_dataset
+    val_size = int(0.33 * len(held_out))
+    final_test_size = len(held_out) - val_size
+    val_subset, final_test_subset = random_split(held_out, [val_size, final_test_size])
 
-    model = GETClassifier(N=9, channels=12, heads=2, out_classes=30, num_blocks=1).to(device)
+    # Extract actual file numbers (val_subset wraps a Subset, so two levels of indexing)
+    val_filenumbers = [
+        held_out.dataset.filenumbers[held_out.indices[i]] for i in val_subset.indices
+    ]
+    final_test_filenumbers = [
+        held_out.dataset.filenumbers[held_out.indices[i]] for i in final_test_subset.indices
+    ]
+
+    val_loader = DataLoader(
+        val_subset, batch_size=1, shuffle=False,
+        num_workers=2, pin_memory=(device == "cuda"),
+    )
+    test_loader = DataLoader(
+        final_test_subset, batch_size=1, shuffle=False,
+        num_workers=2, pin_memory=(device == "cuda"),
+    )
+
+    print(
+        f"Train: {len(train_loader)}  Val: {len(val_loader)}  Test: {len(test_loader)}"
+    )
+
+    model = GETClassifier(N=9, channels=12, heads=2, out_classes=30, num_blocks=1).to(
+        device
+    )
     # model = torch.compile(model)
 
     criterion = nn.CrossEntropyLoss()
@@ -337,10 +382,11 @@ if __name__ == "__main__":
         device=device,
         epochs=100,
         accumulation_steps=4,
-        val_loader=test_loader,
+        val_loader=val_loader,
         patience=15,
         train_filenumbers=train_filenumbers,
-        test_filenumbers=test_filenumbers,
+        val_filenumbers=val_filenumbers,
+        test_filenumbers=final_test_filenumbers,
     )
 
     print("train_loss_hist:", train_loss_hist)
