@@ -107,6 +107,7 @@ def train(
     model.train()
     train_loss_hist = []
     val_loss_hist = []
+    val_acc_hist = []
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -167,6 +168,7 @@ def train(
         if val_loader is not None:
             val_loss, val_acc = validate(model, val_loader, criterion, device)
             val_loss_hist.append(val_loss)
+            val_acc_hist.append(val_acc)
             print(
                 f"Epoch {epoch + 1}: train_loss={epoch_loss:.4f}  "
                 f"val_loss={val_loss:.4f}  val_acc={val_acc:.1f}%"
@@ -196,7 +198,7 @@ def train(
             )
             break
 
-    return train_loss_hist, val_loss_hist
+    return train_loss_hist, val_loss_hist, val_acc_hist
 
 
 def load_data(
