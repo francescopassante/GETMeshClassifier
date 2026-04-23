@@ -1,6 +1,5 @@
 from os import path
 
-import GEUtils
 import torch
 from torch.utils.data import Dataset
 
@@ -9,7 +8,6 @@ class MeshDataset(Dataset):
     def __init__(self, mesh_directory, labels_file, N, filenumbers=None):
         self.base_path = mesh_directory
         self.N = N
-        self._r2r = GEUtils.RegularToRegular(N)
 
         if filenumbers is not None:
             # Use the provided list directly (e.g. when resuming a session)
@@ -39,15 +37,11 @@ class MeshDataset(Dataset):
         file_index = self.filenumbers[idx]
         data = torch.load(f"{self.base_path}T{file_index}.pt", weights_only=False)
 
-        parallel_transport_matrices = self._r2r.extended_regular_representation(
-            data["g_qp"]
-        )
-
         return {
             "x": data["features"],
             "neighbors": data["neighbors"],
             "mask": data["mask"],
-            "parallel_transport_matrices": parallel_transport_matrices,
+            "parallel_transport_angles": data["g_qp"],
             "rel_pos": data["u_q"],
             "label": self.labels[file_index],
             "filenumber": file_index,

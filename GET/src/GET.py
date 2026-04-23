@@ -42,14 +42,17 @@ def validate(model, dataloader, criterion, device):
     correct = 0
     total = 0
 
+    N = model.local_to_regular.N
+    r2r = GEUtils.RegularToRegular(N)
+    r2r.A = r2r.A.to(device)
+
     with torch.no_grad():
         for mesh in dataloader:
             x = mesh["x"].to(device).squeeze(0)
             neighbors = mesh["neighbors"].to(device).squeeze(0)
             mask = mesh["mask"].to(device).squeeze(0)
-            parallel_transport_matrices = (
-                mesh["parallel_transport_matrices"].to(device).squeeze(0)
-            )
+            angles = mesh["parallel_transport_angles"].to(device).squeeze(0)
+            parallel_transport_matrices = r2r.extended_regular_representation(angles)
             rel_pos_u = mesh["rel_pos"].to(device).squeeze(0)
             labels = mesh["label"].to(device).long().squeeze(0)
 
@@ -109,6 +112,8 @@ def train(
     patience_counter = 0
 
     N = model.local_to_regular.N
+    r2r = GEUtils.RegularToRegular(N)
+    r2r.A = r2r.A.to(device)
 
     def _make_checkpoint(epoch, epoch_loss, val_loss=None):
         return {
@@ -132,9 +137,8 @@ def train(
             x = mesh["x"].to(device).squeeze(0)
             neighbors = mesh["neighbors"].to(device).squeeze(0)
             mask = mesh["mask"].to(device).squeeze(0)
-            parallel_transport_matrices = (
-                mesh["parallel_transport_matrices"].to(device).squeeze(0)
-            )
+            angles = mesh["parallel_transport_angles"].to(device).squeeze(0)
+            parallel_transport_matrices = r2r.extended_regular_representation(angles)
             rel_pos_u = mesh["rel_pos"].to(device).squeeze(0)
             labels = mesh["label"].to(device).long().squeeze(0)
 
@@ -297,10 +301,13 @@ def check_gauge_invariance(data, N, channels, heads):
 
     x = data["x"].squeeze(0)
     neighbors = data["neighbors"].squeeze(0)
-    parallel_transport_matrices = data["parallel_transport_matrices"].squeeze(0)
+    pt_angles = data["parallel_transport_angles"].squeeze(0)
 
     rel_pos_u = data["rel_pos"].squeeze(0)
     mask = data["mask"].squeeze(0)
+
+    r2r = GEUtils.RegularToRegular(N)
+    parallel_transport_matrices = r2r.extended_regular_representation(pt_angles)
 
     # generate a tensor of N_v random angles of the form 2pik/N k integer:
     angles = torch.randint(0, N, (x.shape[0],)) * (2 * torch.pi / N)
@@ -319,7 +326,6 @@ def check_gauge_invariance(data, N, channels, heads):
     x_rot = torch.einsum("vij,vj->vi", rot_mat_3d, x)
     rot_rel_pos_u = torch.einsum("vij,vnj->vni", rot_mat_3d[:, :2, :2], rel_pos_u)
     # The parallel transport angles transform as: new_theta_nv = theta_nv + random_angle_v - random_angle_n
-    r2r = GEUtils.RegularToRegular(N)
     rot_parallel_transport_matrices = (
         parallel_transport_matrices
         @ r2r.extended_regular_representation(angles.unsqueeze(-1))
