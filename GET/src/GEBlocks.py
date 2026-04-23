@@ -183,19 +183,8 @@ class GESelfAttentionBlock(nn.Module):
         score = torch.relu(Q.unsqueeze(1) + K).mean(dim=-1)  # [N_v, MAX_NEIGH, H]
         score = score.masked_fill(~mask.unsqueeze(-1), 0.0)
 
-        score_denominator = score.sum(dim=1)  # [N_v, H]
-        # Dead-attention fallback: if all scores are zero for a vertex/head, use
-        # uniform attention over valid neighbors instead of a near-zero denominator.
-        dead_mask = score_denominator < 1e-6  # [N_v, H]
-        n_valid = mask.sum(dim=1, keepdim=True).clamp(min=1).float()  # [N_v, 1]
-        uniform = mask.unsqueeze(-1).float() / n_valid.unsqueeze(
-            -1
-        )  # [N_v, MAX_NEIGH, 1]
-        attention = torch.where(
-            dead_mask.unsqueeze(1),
-            uniform,
-            score / score_denominator.unsqueeze(1).clamp(min=1e-6),
-        )  # [N_v, MAX_NEIGH, H]
+        score_denominator = score.sum(dim=1).clamp(min=1e-6)  # [N_v, H]
+        attention = score / score_denominator.unsqueeze(1)  # [N_v, MAX_NEIGH, H]
 
         u_0 = rel_pos_u[..., 0]
         u_1 = rel_pos_u[..., 1]
@@ -210,30 +199,23 @@ class GESelfAttentionBlock(nn.Module):
         )
         values = torch.einsum("hcij, vncj -> vnhci", W0, f_prime_q)
 
-        # First order — slice over the positional dimension to avoid a large
-        # [N_v, MAX_NEIGH, C, 2, N] intermediate tensor in memory.
+        # First order
         W1 = torch.einsum(
             "hcb, boij -> hcoij",
             self.value_matrix_first_order_params,
             self.value_basis_first_order,
         )
-        for o_idx in range(rel_pos_u.shape[-1]):  # 2 iterations
-            W1_o = W1[:, :, o_idx, :, :]  # [H, C, N, N]
-            values = values + torch.einsum(
-                "hcij, vncj, vn -> vnhci", W1_o, f_prime_q, rel_pos_u[..., o_idx]
-            )
+        f_u_1 = torch.einsum("vncj, vno -> vncoj", f_prime_q, rel_pos_u)
+        values = values + torch.einsum("hcoij, vncoj -> vnhci", W1, f_u_1)
 
-        # Second order — same trick over u_quad's 3 components.
+        # Second order
         W2 = torch.einsum(
             "hcb, boij -> hcoij",
             self.value_matrix_second_order_params,
             self.value_basis_second_order,
         )
-        for o_idx in range(u_quad.shape[-1]):  # 3 iterations
-            W2_o = W2[:, :, o_idx, :, :]  # [H, C, N, N]
-            values = values + torch.einsum(
-                "hcij, vncj, vn -> vnhci", W2_o, f_prime_q, u_quad[..., o_idx]
-            )
+        f_u_2 = torch.einsum("vncj, vno -> vncoj", f_prime_q, u_quad)
+        values = values + torch.einsum("hcoij, vncoj -> vnhci", W2, f_u_2)
 
         # Aggregation across neighbors using per-head attention
         head_outputs = torch.einsum("vnh, vnhci -> vhci", attention, values)
