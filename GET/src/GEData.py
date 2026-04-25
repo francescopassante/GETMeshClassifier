@@ -5,9 +5,8 @@ from torch.utils.data import Dataset
 
 
 class MeshDataset(Dataset):
-    def __init__(self, mesh_directory, labels_file, N, filenumbers=None):
+    def __init__(self, mesh_directory, labels_file, filenumbers=None):
         self.base_path = mesh_directory
-        self.N = N
 
         if filenumbers is not None:
             # Use the provided list directly (e.g. when resuming a session)

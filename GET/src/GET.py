@@ -11,6 +11,7 @@ from tqdm import tqdm
 class GETClassifier(nn.Module):
     def __init__(self, N, channels, heads, out_classes, num_blocks=1):
         super().__init__()
+        self.N = N
         self.local_to_regular = GEBlocks.GELocalToRegularLinearBlock(N, channels)
 
         self.blocks = nn.ModuleList(
@@ -42,7 +43,7 @@ def validate(model, dataloader, criterion, device):
     correct = 0
     total = 0
 
-    N = model.local_to_regular.N
+    N = model.N
     r2r = GEUtils.RegularToRegular(N)
     r2r.A = r2r.A.to(device)
 
@@ -68,6 +69,16 @@ def validate(model, dataloader, criterion, device):
     return total_loss / len(dataloader), 100.0 * correct / total
 
 
+def _filenumbers_from_loader(loader):
+    """Extract filenumbers from a DataLoader wrapping a MeshDataset or Subset thereof."""
+    if loader is None:
+        return None
+    ds = loader.dataset
+    if isinstance(ds, torch.utils.data.Subset):
+        return [ds.dataset.filenumbers[i] for i in ds.indices]
+    return list(ds.filenumbers)
+
+
 def train(
     model,
     dataloader,
@@ -75,35 +86,33 @@ def train(
     scheduler,
     criterion,
     device,
+    val_loader,
     epochs=1,
     accumulation_steps=16,
-    val_loader=None,
     patience=10,
     min_delta=1e-4,
     start_epoch=0,
-    train_filenumbers=None,
-    val_filenumbers=None,
-    test_filenumbers=None,
+    test_loader=None,
 ):
     """
     Train the model.
 
     Args:
-        val_loader:         Optional validation DataLoader. When provided, validation
-                            loss is computed after each epoch and early stopping is
-                            applied when it stops improving.
-        patience:           Number of epochs without improvement before stopping.
-        min_delta:          Minimum decrease in val loss to count as an improvement.
-        start_epoch:        Epoch to start from (use when resuming from a checkpoint).
-        train_filenumbers:  List of file numbers in the training set.
-        val_filenumbers:    List of file numbers in the validation set.
-        test_filenumbers:   List of file numbers in the test set.
-                            All three are saved in every checkpoint so the exact
-                            train/val/test split can be reproduced later.
+        val_loader:   Optional validation DataLoader. When provided, validation
+                      loss is computed after each epoch and early stopping is
+                      applied when it stops improving.
+        patience:     Number of epochs without improvement before stopping.
+        min_delta:    Minimum decrease in val loss to count as an improvement.
+        start_epoch:  Epoch to start from (use when resuming from a checkpoint).
+        test_loader:  Optional test DataLoader. Its filenumbers are saved in every
+                      checkpoint so the train/val/test split can be reproduced later.
 
     Returns:
         (train_loss_hist, val_loss_hist)  — val_loss_hist is empty when val_loader is None.
     """
+    train_filenumbers = _filenumbers_from_loader(dataloader)
+    val_filenumbers = _filenumbers_from_loader(val_loader)
+    test_filenumbers = _filenumbers_from_loader(test_loader)
     model.train()
     train_loss_hist = []
     val_loss_hist = []
@@ -112,14 +121,13 @@ def train(
     best_val_loss = float("inf")
     patience_counter = 0
 
-    N = model.local_to_regular.N
+    N = model.N
     r2r = GEUtils.RegularToRegular(N)
     r2r.A = r2r.A.to(device)
 
     def _make_checkpoint(epoch, epoch_loss, val_loss=None):
         return {
             "epoch": epoch,
-            "N": N,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -128,6 +136,9 @@ def train(
             "train_filenumbers": train_filenumbers,
             "val_filenumbers": val_filenumbers,
             "test_filenumbers": test_filenumbers,
+            "train_loss_hist": list(train_loss_hist),
+            "val_loss_hist": list(val_loss_hist),
+            "val_acc_hist": list(val_acc_hist),
         }
 
     for epoch in range(start_epoch, start_epoch + epochs):
@@ -146,9 +157,6 @@ def train(
             outputs = model(x, neighbors, mask, parallel_transport_matrices, rel_pos_u)
             raw_loss = criterion(outputs.unsqueeze(0), labels.unsqueeze(0))
 
-            if torch.isnan(raw_loss):
-                print("NAN LOSS")
-
             scaled_loss = raw_loss / accumulation_steps
             scaled_loss.backward()
 
@@ -161,7 +169,6 @@ def train(
 
         epoch_loss = total_loss / len(dataloader)
         train_loss_hist.append(epoch_loss)
-        scheduler.step()
 
         # Validation
         val_loss = None
@@ -186,6 +193,7 @@ def train(
             else:
                 patience_counter += 1
                 print(f"  -> No improvement ({patience_counter}/{patience})")
+            scheduler.step(val_loss)
         else:
             print(f"Epoch {epoch + 1}: train_loss={epoch_loss:.4f}")
 
@@ -202,7 +210,7 @@ def train(
 
 
 def load_data(
-    mesh_directory, labels_file, N, train_percent, val_percent=0.15, device="cpu"
+    mesh_directory, labels_file, train_percent, val_percent=0.15, device="cpu"
 ):
     """
     Create train/val/test DataLoaders from a single random split of the dataset.
@@ -214,14 +222,13 @@ def load_data(
 
     Returns a dict with keys:
         "train_loader", "val_loader", "test_loader"
-        "train_filenumbers", "val_filenumbers", "test_filenumbers"
 
-    Pass the filenumber lists to train() so they are saved in every checkpoint
-    and the exact split can be reproduced with load_data_from_session().
+    Filenumbers are embedded in the loaders' datasets and extracted automatically
+    by train(), so the exact split can be reproduced with load_data_from_session().
     """
     assert train_percent + val_percent < 1.0, "train + val must be < 1"
 
-    full_dataset = GEData.MeshDataset(mesh_directory, labels_file, N)
+    full_dataset = GEData.MeshDataset(mesh_directory, labels_file)
     n = len(full_dataset)
 
     train_size = int(train_percent * n)
@@ -231,9 +238,6 @@ def load_data(
     train_subset, val_subset, test_subset = random_split(
         full_dataset, [train_size, val_size, test_size]
     )
-
-    def _filenums(subset):
-        return [full_dataset.filenumbers[i] for i in subset.indices]
 
     def _loader(subset, shuffle):
         return DataLoader(
@@ -248,9 +252,6 @@ def load_data(
         "train_loader": _loader(train_subset, shuffle=True),
         "val_loader": _loader(val_subset, shuffle=False),
         "test_loader": _loader(test_subset, shuffle=False),
-        "train_filenumbers": _filenums(train_subset),
-        "val_filenumbers": _filenums(val_subset),
-        "test_filenumbers": _filenums(test_subset),
     }
 
 
@@ -258,7 +259,7 @@ def load_data_from_session(checkpoint_path, mesh_directory, labels_file, device=
     """
     Recreate the exact train/val/test DataLoaders from a saved checkpoint.
 
-    The checkpoint must contain 'train_filenumbers', 'test_filenumbers', 'N', and
+    The checkpoint must contain 'train_filenumbers' and 'test_filenumbers', and
     optionally 'val_filenumbers' (all saved automatically by train()).
 
     Returns a dict with keys:
@@ -269,11 +270,10 @@ def load_data_from_session(checkpoint_path, mesh_directory, labels_file, device=
                           scheduler and resuming from start_epoch=checkpoint["epoch"]+1
     """
     checkpoint = torch.load(checkpoint_path, weights_only=False)
-    N = checkpoint["N"]
 
     def _make_loader(filenumbers, shuffle):
         dataset = GEData.MeshDataset(
-            mesh_directory, labels_file, N, filenumbers=filenumbers
+            mesh_directory, labels_file, filenumbers=filenumbers
         )
         return DataLoader(
             dataset,
@@ -285,11 +285,7 @@ def load_data_from_session(checkpoint_path, mesh_directory, labels_file, device=
 
     train_loader = _make_loader(checkpoint["train_filenumbers"], shuffle=True)
     test_loader = _make_loader(checkpoint["test_filenumbers"], shuffle=False)
-
-    val_filenumbers = checkpoint.get("val_filenumbers")
-    val_loader = (
-        _make_loader(val_filenumbers, shuffle=False) if val_filenumbers else None
-    )
+    val_loader = _make_loader(checkpoint["val_filenumbers"], shuffle=False)
 
     return {
         "train_loader": train_loader,
@@ -357,7 +353,6 @@ if __name__ == "__main__":
     data = load_data(
         mesh_directory="../data/SHREC11_200NEIGH/processed/",
         labels_file="../data/SHREC11_200NEIGH/classes.txt",
-        N=9,
         train_percent=0.7,
         val_percent=0.15,
         device=device,
@@ -376,12 +371,12 @@ if __name__ == "__main__":
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.1)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=8)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model has {num_params} parameters")
 
-    train_loss_hist, val_loss_hist = train(
+    train_loss_hist, val_loss_hist, val_acc_hist = train(
         model=model,
         dataloader=data["train_loader"],
         optimizer=optimizer,
@@ -389,13 +384,12 @@ if __name__ == "__main__":
         criterion=criterion,
         device=device,
         epochs=100,
-        accumulation_steps=4,
+        accumulation_steps=16,
         val_loader=data["val_loader"],
-        patience=15,
-        train_filenumbers=data["train_filenumbers"],
-        val_filenumbers=data["val_filenumbers"],
-        test_filenumbers=data["test_filenumbers"],
+        patience=25,
+        test_loader=data["test_loader"],
     )
 
     print("train_loss_hist:", train_loss_hist)
     print("val_loss_hist:  ", val_loss_hist)
+    print("val_acc_hist:   ", val_acc_hist)
