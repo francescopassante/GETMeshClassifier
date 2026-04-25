@@ -1,4 +1,4 @@
-# GETMeshClassifier
+# Gauge Equivairant Transformer - Mesh Classifier
 Gauge Equivariant Transformer for 3D mesh classification on the SHREC11 dataset.
 
 ---
